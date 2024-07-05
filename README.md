@@ -59,6 +59,5 @@ If the transaction is successful, the script will output the transaction hash.
 ## License
 
 This project is licensed under the MIT License.
-```
 
 Replace `YOUR_INFURA_PROJECT_ID`, `YOUR_FROM_ADDRESS`, `YOUR_TO_ADDRESS`, and `YOUR_PRIVATE_KEY` with your actual details before running the script. 
