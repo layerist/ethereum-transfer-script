@@ -1,38 +1,52 @@
 import os
+import logging
 from web3 import Web3
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Загрузка переменных окружения из файла .env
 load_dotenv()
 
-# Get environment variables
+# Получение переменных окружения
 INFURA_URL = os.getenv("INFURA_URL")
 FROM_ADDRESS = os.getenv("FROM_ADDRESS")
 TO_ADDRESS = os.getenv("TO_ADDRESS")
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
 
-# Validate environment variables
-if not INFURA_URL or not FROM_ADDRESS or not TO_ADDRESS or not PRIVATE_KEY:
-    raise ValueError("One or more environment variables are missing")
+# Проверка наличия всех необходимых переменных окружения
+required_env_vars = {
+    "INFURA_URL": INFURA_URL,
+    "FROM_ADDRESS": FROM_ADDRESS,
+    "TO_ADDRESS": TO_ADDRESS,
+    "PRIVATE_KEY": PRIVATE_KEY
+}
 
-# Connect to Ethereum node
+missing_vars = [key for key, value in required_env_vars.items() if not value]
+
+if missing_vars:
+    raise ValueError(f"Отсутствуют следующие переменные окружения: {', '.join(missing_vars)}")
+
+# Подключение к Ethereum узлу
 web3 = Web3(Web3.HTTPProvider(INFURA_URL))
 
-# Check if connected
+# Проверка подключения
 if not web3.isConnected():
-    raise ConnectionError("Failed to connect to Ethereum node")
+    raise ConnectionError("Не удалось подключиться к Ethereum узлу")
 
-# Amount to send (in ether)
+# Сумма для отправки (в эфирах)
 amount = 0.01
 
-# Convert ether to wei
+# Конвертация эфира в вей
 value = web3.toWei(amount, 'ether')
 
 try:
-    # Get the nonce (number of transactions sent from the address)
+    # Получение nonce (число транзакций, отправленных с адреса)
     nonce = web3.eth.getTransactionCount(FROM_ADDRESS)
 
-    # Build the transaction
+    # Построение транзакции
     tx = {
         'nonce': nonce,
         'to': TO_ADDRESS,
@@ -41,14 +55,14 @@ try:
         'gasPrice': web3.toWei('50', 'gwei')
     }
 
-    # Sign the transaction
+    # Подписание транзакции
     signed_tx = web3.eth.account.sign_transaction(tx, PRIVATE_KEY)
 
-    # Send the transaction
+    # Отправка транзакции
     tx_hash = web3.eth.sendRawTransaction(signed_tx.rawTransaction)
 
-    # Get transaction hash
-    print(f"Transaction successful with hash: {web3.toHex(tx_hash)}")
+    # Вывод хеша транзакции
+    logger.info(f"Транзакция успешна с хешем: {web3.toHex(tx_hash)}")
 
 except Exception as e:
-    print(f"An error occurred: {e}")
+    logger.error(f"Произошла ошибка: {e}")
