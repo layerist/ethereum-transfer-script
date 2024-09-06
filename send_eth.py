@@ -3,8 +3,8 @@ import logging
 from web3 import Web3
 from dotenv import load_dotenv
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Load environment variables from .env file
@@ -16,7 +16,7 @@ FROM_ADDRESS = os.getenv("FROM_ADDRESS")
 TO_ADDRESS = os.getenv("TO_ADDRESS")
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
 
-# Verify that all necessary environment variables are set
+# Validate environment variables
 required_env_vars = {
     "INFURA_URL": INFURA_URL,
     "FROM_ADDRESS": FROM_ADDRESS,
@@ -26,43 +26,51 @@ required_env_vars = {
 
 missing_vars = [key for key, value in required_env_vars.items() if not value]
 if missing_vars:
+    logger.critical(f"Missing environment variables: {', '.join(missing_vars)}")
     raise EnvironmentError(f"Missing environment variables: {', '.join(missing_vars)}")
 
 # Connect to the Ethereum node
 web3 = Web3(Web3.HTTPProvider(INFURA_URL))
 
-# Check connection
 if not web3.isConnected():
+    logger.critical("Failed to connect to Ethereum node")
     raise ConnectionError("Failed to connect to Ethereum node")
 
-# Amount to send (in Ether)
-amount = 0.01
+def send_ether(from_address, to_address, private_key, amount_ether):
+    try:
+        # Convert Ether to Wei
+        value = web3.toWei(amount_ether, 'ether')
 
-# Convert Ether to Wei
-value = web3.toWei(amount, 'ether')
+        # Get the nonce
+        nonce = web3.eth.getTransactionCount(from_address)
 
-try:
-    # Get the nonce (number of transactions sent from the address)
-    nonce = web3.eth.getTransactionCount(FROM_ADDRESS)
+        # Build the transaction
+        tx = {
+            'nonce': nonce,
+            'to': to_address,
+            'value': value,
+            'gas': 21000,
+            'gasPrice': web3.eth.gasPrice
+        }
 
-    # Build the transaction
-    tx = {
-        'nonce': nonce,
-        'to': TO_ADDRESS,
-        'value': value,
-        'gas': 21000,
-        'gasPrice': web3.eth.gasPrice
-    }
+        # Sign the transaction
+        signed_tx = web3.eth.account.sign_transaction(tx, private_key)
 
-    # Sign the transaction
-    signed_tx = web3.eth.account.sign_transaction(tx, PRIVATE_KEY)
+        # Send the transaction
+        tx_hash = web3.eth.sendRawTransaction(signed_tx.rawTransaction)
 
-    # Send the transaction
-    tx_hash = web3.eth.sendRawTransaction(signed_tx.rawTransaction)
+        # Log the transaction hash
+        logger.info(f"Transaction successful with hash: {web3.toHex(tx_hash)}")
+        return tx_hash
 
-    # Log the transaction hash
-    logger.info(f"Transaction successful with hash: {web3.toHex(tx_hash)}")
+    except Exception as e:
+        logger.error(f"An error occurred while sending Ether: {e}")
+        raise
 
-except Exception as e:
-    logger.error(f"An error occurred: {e}")
-    raise
+if __name__ == "__main__":
+    try:
+        amount_to_send = 0.01  # Amount in Ether
+        tx_hash = send_ether(FROM_ADDRESS, TO_ADDRESS, PRIVATE_KEY, amount_to_send)
+        logger.info(f"Transaction hash: {web3.toHex(tx_hash)}")
+    except Exception as e:
+        logger.critical(f"Script terminated due to error: {e}")
