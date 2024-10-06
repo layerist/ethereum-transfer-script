@@ -4,7 +4,10 @@ from web3 import Web3
 from dotenv import load_dotenv
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # Load environment variables from .env file
@@ -27,8 +30,9 @@ def validate_env_vars():
     
     missing_vars = [key for key, value in required_vars.items() if not value]
     if missing_vars:
-        logger.critical(f"Missing environment variables: {', '.join(missing_vars)}")
-        raise EnvironmentError(f"Missing environment variables: {', '.join(missing_vars)}")
+        error_message = f"Missing environment variables: {', '.join(missing_vars)}"
+        logger.critical(error_message)
+        raise EnvironmentError(error_message)
     
 # Validate the environment variables
 validate_env_vars()
@@ -41,6 +45,17 @@ if not web3.isConnected():
     raise ConnectionError("Failed to connect to Ethereum node")
 
 def send_ether(from_address, to_address, private_key, amount_ether):
+    """Send Ether from one address to another.
+
+    Args:
+        from_address (str): The sender's Ethereum address.
+        to_address (str): The receiver's Ethereum address.
+        private_key (str): The private key for the sender's address.
+        amount_ether (float): Amount of Ether to send.
+
+    Returns:
+        str: Transaction hash of the sent Ether.
+    """
     try:
         # Convert Ether to Wei
         value = web3.toWei(amount_ether, 'ether')
@@ -65,7 +80,7 @@ def send_ether(from_address, to_address, private_key, amount_ether):
 
         # Log the transaction hash
         logger.info(f"Transaction successful with hash: {web3.toHex(tx_hash)}")
-        return tx_hash
+        return web3.toHex(tx_hash)
 
     except Exception as e:
         logger.error(f"Error while sending Ether: {e}")
@@ -73,8 +88,11 @@ def send_ether(from_address, to_address, private_key, amount_ether):
 
 if __name__ == "__main__":
     try:
-        amount_to_send = 0.01  # Ether amount to be sent
+        # Amount of Ether to be sent
+        amount_to_send = 0.01
+
+        # Send Ether and log the transaction hash
         tx_hash = send_ether(FROM_ADDRESS, TO_ADDRESS, PRIVATE_KEY, amount_to_send)
-        logger.info(f"Transaction hash: {web3.toHex(tx_hash)}")
+        logger.info(f"Transaction hash: {tx_hash}")
     except Exception as e:
         logger.critical(f"Script terminated due to error: {e}")
