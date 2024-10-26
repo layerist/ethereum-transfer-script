@@ -2,6 +2,7 @@ import os
 import logging
 from web3 import Web3
 from dotenv import load_dotenv
+from typing import Optional
 
 # Configure logging
 logging.basicConfig(
@@ -14,13 +15,13 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 # Retrieve environment variables
-INFURA_URL = os.getenv("INFURA_URL")
-FROM_ADDRESS = os.getenv("FROM_ADDRESS")
-TO_ADDRESS = os.getenv("TO_ADDRESS")
-PRIVATE_KEY = os.getenv("PRIVATE_KEY")
+INFURA_URL: Optional[str] = os.getenv("INFURA_URL")
+FROM_ADDRESS: Optional[str] = os.getenv("FROM_ADDRESS")
+TO_ADDRESS: Optional[str] = os.getenv("TO_ADDRESS")
+PRIVATE_KEY: Optional[str] = os.getenv("PRIVATE_KEY")
 
-# Function to validate environment variables
 def validate_env_vars():
+    """Ensure all required environment variables are present."""
     required_vars = {
         "INFURA_URL": INFURA_URL,
         "FROM_ADDRESS": FROM_ADDRESS,
@@ -33,8 +34,8 @@ def validate_env_vars():
         error_message = f"Missing environment variables: {', '.join(missing_vars)}"
         logger.critical(error_message)
         raise EnvironmentError(error_message)
-    
-# Validate the environment variables
+
+# Validate environment variables
 validate_env_vars()
 
 # Connect to the Ethereum node
@@ -44,9 +45,9 @@ if not web3.isConnected():
     logger.critical("Failed to connect to Ethereum node")
     raise ConnectionError("Failed to connect to Ethereum node")
 
-def send_ether(from_address, to_address, private_key, amount_ether):
+def send_ether(from_address: str, to_address: str, private_key: str, amount_ether: float) -> str:
     """Send Ether from one address to another.
-
+    
     Args:
         from_address (str): The sender's Ethereum address.
         to_address (str): The receiver's Ethereum address.
@@ -79,20 +80,18 @@ def send_ether(from_address, to_address, private_key, amount_ether):
         tx_hash = web3.eth.sendRawTransaction(signed_tx.rawTransaction)
 
         # Log the transaction hash
-        logger.info(f"Transaction successful with hash: {web3.toHex(tx_hash)}")
-        return web3.toHex(tx_hash)
+        tx_hash_hex = web3.toHex(tx_hash)
+        logger.info(f"Transaction successful with hash: {tx_hash_hex}")
+        return tx_hash_hex
 
     except Exception as e:
-        logger.error(f"Error while sending Ether: {e}")
+        logger.error(f"Error while sending Ether: {e}", exc_info=True)
         raise
 
 if __name__ == "__main__":
+    amount_to_send = 0.01  # Define the amount of Ether to be sent
     try:
-        # Amount of Ether to be sent
-        amount_to_send = 0.01
-
-        # Send Ether and log the transaction hash
         tx_hash = send_ether(FROM_ADDRESS, TO_ADDRESS, PRIVATE_KEY, amount_to_send)
         logger.info(f"Transaction hash: {tx_hash}")
     except Exception as e:
-        logger.critical(f"Script terminated due to error: {e}")
+        logger.critical(f"Script terminated due to error: {e}", exc_info=True)
