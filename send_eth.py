@@ -21,7 +21,7 @@ TO_ADDRESS: Optional[str] = os.getenv("TO_ADDRESS")
 PRIVATE_KEY: Optional[str] = os.getenv("PRIVATE_KEY")
 
 def validate_env_vars():
-    """Ensure all required environment variables are present."""
+    """Ensure all required environment variables are present and valid."""
     required_vars = {
         "INFURA_URL": INFURA_URL,
         "FROM_ADDRESS": FROM_ADDRESS,
@@ -42,7 +42,7 @@ validate_env_vars()
 web3 = Web3(Web3.HTTPProvider(INFURA_URL))
 
 if not web3.isConnected():
-    logger.critical("Failed to connect to Ethereum node")
+    logger.critical("Failed to connect to Ethereum node. Check INFURA_URL.")
     raise ConnectionError("Failed to connect to Ethereum node")
 
 def send_ether(from_address: str, to_address: str, private_key: str, amount_ether: float) -> str:
@@ -61,6 +61,11 @@ def send_ether(from_address: str, to_address: str, private_key: str, amount_ethe
         # Convert Ether to Wei
         value = web3.toWei(amount_ether, 'ether')
 
+        # Check balance
+        balance = web3.eth.get_balance(from_address)
+        if balance < value:
+            raise ValueError("Insufficient balance for the transaction.")
+
         # Get the current transaction nonce
         nonce = web3.eth.getTransactionCount(from_address)
 
@@ -70,20 +75,23 @@ def send_ether(from_address: str, to_address: str, private_key: str, amount_ethe
             'to': to_address,
             'value': value,
             'gas': 21000,
-            'gasPrice': web3.eth.gasPrice
+            'gasPrice': web3.eth.gas_price
         }
 
         # Sign the transaction
         signed_tx = web3.eth.account.sign_transaction(tx, private_key)
 
         # Send the transaction and get the transaction hash
-        tx_hash = web3.eth.sendRawTransaction(signed_tx.rawTransaction)
+        tx_hash = web3.eth.send_raw_transaction(signed_tx.rawTransaction)
 
         # Log the transaction hash
         tx_hash_hex = web3.toHex(tx_hash)
         logger.info(f"Transaction successful with hash: {tx_hash_hex}")
         return tx_hash_hex
 
+    except ValueError as ve:
+        logger.error(f"Value error: {ve}")
+        raise
     except Exception as e:
         logger.error(f"Error while sending Ether: {e}", exc_info=True)
         raise
