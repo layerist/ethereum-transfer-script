@@ -6,12 +6,12 @@ from typing import Optional
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO, 
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("EtherTransfer")
 
-# Load environment variables from .env file
+# Load environment variables
 load_dotenv()
 
 # Retrieve environment variables
@@ -20,13 +20,14 @@ FROM_ADDRESS: Optional[str] = os.getenv("FROM_ADDRESS")
 TO_ADDRESS: Optional[str] = os.getenv("TO_ADDRESS")
 PRIVATE_KEY: Optional[str] = os.getenv("PRIVATE_KEY")
 
-def validate_env_vars():
+
+def validate_env_vars() -> None:
     """Ensure all required environment variables are present and valid."""
     required_vars = {
         "INFURA_URL": INFURA_URL,
         "FROM_ADDRESS": FROM_ADDRESS,
         "TO_ADDRESS": TO_ADDRESS,
-        "PRIVATE_KEY": PRIVATE_KEY
+        "PRIVATE_KEY": PRIVATE_KEY,
     }
     
     missing_vars = [key for key, value in required_vars.items() if not value]
@@ -34,6 +35,7 @@ def validate_env_vars():
         error_message = f"Missing environment variables: {', '.join(missing_vars)}"
         logger.critical(error_message)
         raise EnvironmentError(error_message)
+
 
 # Validate environment variables
 validate_env_vars()
@@ -44,6 +46,7 @@ web3 = Web3(Web3.HTTPProvider(INFURA_URL))
 if not web3.isConnected():
     logger.critical("Failed to connect to Ethereum node. Check INFURA_URL.")
     raise ConnectionError("Failed to connect to Ethereum node")
+
 
 def send_ether(from_address: str, to_address: str, private_key: str, amount_ether: float) -> str:
     """Send Ether from one address to another.
@@ -59,11 +62,12 @@ def send_ether(from_address: str, to_address: str, private_key: str, amount_ethe
     """
     try:
         # Convert Ether to Wei
-        value = web3.toWei(amount_ether, 'ether')
+        value = web3.toWei(amount_ether, "ether")
 
-        # Check balance
+        # Check sender's balance
         balance = web3.eth.get_balance(from_address)
         if balance < value:
+            logger.error("Insufficient balance for the transaction.")
             raise ValueError("Insufficient balance for the transaction.")
 
         # Get the current transaction nonce
@@ -71,11 +75,11 @@ def send_ether(from_address: str, to_address: str, private_key: str, amount_ethe
 
         # Build the transaction
         tx = {
-            'nonce': nonce,
-            'to': to_address,
-            'value': value,
-            'gas': 21000,
-            'gasPrice': web3.eth.gas_price
+            "nonce": nonce,
+            "to": to_address,
+            "value": value,
+            "gas": 21000,
+            "gasPrice": web3.eth.gas_price,
         }
 
         # Sign the transaction
@@ -93,13 +97,15 @@ def send_ether(from_address: str, to_address: str, private_key: str, amount_ethe
         logger.error(f"Value error: {ve}")
         raise
     except Exception as e:
-        logger.error(f"Error while sending Ether: {e}", exc_info=True)
+        logger.error(f"Unexpected error while sending Ether: {e}", exc_info=True)
         raise
 
+
 if __name__ == "__main__":
-    amount_to_send = 0.01  # Define the amount of Ether to be sent
     try:
+        amount_to_send = 0.01  # Define the amount of Ether to be sent
+        logger.info(f"Starting Ether transfer of {amount_to_send} ETH from {FROM_ADDRESS} to {TO_ADDRESS}.")
         tx_hash = send_ether(FROM_ADDRESS, TO_ADDRESS, PRIVATE_KEY, amount_to_send)
-        logger.info(f"Transaction hash: {tx_hash}")
+        logger.info(f"Transaction completed. Transaction hash: {tx_hash}")
     except Exception as e:
         logger.critical(f"Script terminated due to error: {e}", exc_info=True)
