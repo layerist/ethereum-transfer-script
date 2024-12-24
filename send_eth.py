@@ -19,6 +19,7 @@ INFURA_URL: Optional[str] = os.getenv("INFURA_URL")
 FROM_ADDRESS: Optional[str] = os.getenv("FROM_ADDRESS")
 TO_ADDRESS: Optional[str] = os.getenv("TO_ADDRESS")
 PRIVATE_KEY: Optional[str] = os.getenv("PRIVATE_KEY")
+DEFAULT_GAS_PRICE: Optional[int] = int(os.getenv("DEFAULT_GAS_PRICE", 20_000_000_000))
 
 
 def validate_env_vars() -> None:
@@ -29,12 +30,18 @@ def validate_env_vars() -> None:
         "TO_ADDRESS": TO_ADDRESS,
         "PRIVATE_KEY": PRIVATE_KEY,
     }
-    
+
     missing_vars = [key for key, value in required_vars.items() if not value]
     if missing_vars:
         error_message = f"Missing environment variables: {', '.join(missing_vars)}"
         logger.critical(error_message)
         raise EnvironmentError(error_message)
+
+    # Validate Ethereum addresses
+    if not Web3.isAddress(FROM_ADDRESS):
+        raise ValueError("Invalid FROM_ADDRESS format.")
+    if not Web3.isAddress(TO_ADDRESS):
+        raise ValueError("Invalid TO_ADDRESS format.")
 
 
 # Validate environment variables
@@ -47,10 +54,9 @@ if not web3.isConnected():
     logger.critical("Failed to connect to Ethereum node. Check INFURA_URL.")
     raise ConnectionError("Failed to connect to Ethereum node")
 
-
 def send_ether(from_address: str, to_address: str, private_key: str, amount_ether: float) -> str:
     """Send Ether from one address to another.
-    
+
     Args:
         from_address (str): The sender's Ethereum address.
         to_address (str): The receiver's Ethereum address.
@@ -79,7 +85,7 @@ def send_ether(from_address: str, to_address: str, private_key: str, amount_ethe
             "to": to_address,
             "value": value,
             "gas": 21000,
-            "gasPrice": web3.eth.gas_price,
+            "gasPrice": DEFAULT_GAS_PRICE or web3.eth.gas_price,
         }
 
         # Sign the transaction
@@ -99,7 +105,6 @@ def send_ether(from_address: str, to_address: str, private_key: str, amount_ethe
     except Exception as e:
         logger.error(f"Unexpected error while sending Ether: {e}", exc_info=True)
         raise
-
 
 if __name__ == "__main__":
     try:
