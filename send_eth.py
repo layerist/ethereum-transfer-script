@@ -1,6 +1,6 @@
 import os
 import logging
-from web3 import Web3
+from web3 import Web3, exceptions
 from dotenv import load_dotenv
 from typing import Optional
 
@@ -19,13 +19,13 @@ INFURA_URL: Optional[str] = os.getenv("INFURA_URL")
 FROM_ADDRESS: Optional[str] = os.getenv("FROM_ADDRESS")
 TO_ADDRESS: Optional[str] = os.getenv("TO_ADDRESS")
 PRIVATE_KEY: Optional[str] = os.getenv("PRIVATE_KEY")
-DEFAULT_GAS_PRICE: Optional[int] = int(os.getenv("DEFAULT_GAS_PRICE", 0))
+DEFAULT_GAS_PRICE: Optional[int] = int(os.getenv("DEFAULT_GAS_PRICE", 0)) or None
 
 
-def validate_ethereum_address(address: str) -> None:
+def validate_ethereum_address(address: Optional[str]) -> None:
     """Validate an Ethereum address."""
-    if not Web3.isAddress(address):
-        raise ValueError(f"Invalid Ethereum address format: {address}")
+    if not address or not Web3.isAddress(address):
+        raise ValueError(f"Invalid Ethereum address: {address}")
 
 
 def validate_env_vars() -> None:
@@ -78,7 +78,7 @@ def send_ether(
     """
     try:
         # Convert Ether to Wei
-        value = web3.toWei(amount_ether, "ether")
+        value = web3.to_wei(amount_ether, "ether")
 
         # Check sender's balance
         balance = web3.eth.get_balance(from_address)
@@ -89,15 +89,22 @@ def send_ether(
         # Get the current transaction nonce
         nonce = web3.eth.get_transaction_count(from_address)
 
-        # Determine gas price
+        # Determine gas price (use default or fetch from network)
         gas_price = DEFAULT_GAS_PRICE or web3.eth.gas_price
+
+        # Estimate gas limit dynamically
+        estimated_gas = web3.eth.estimate_gas({
+            "from": from_address,
+            "to": to_address,
+            "value": value
+        })
 
         # Build the transaction
         tx = {
             "nonce": nonce,
             "to": to_address,
             "value": value,
-            "gas": 21000,
+            "gas": estimated_gas,
             "gasPrice": gas_price,
         }
 
@@ -112,6 +119,9 @@ def send_ether(
         logger.info(f"Transaction successful. Hash: {tx_hash_hex}")
         return tx_hash_hex
 
+    except exceptions.InsufficientFunds as e:
+        logger.error(f"Insufficient funds: {e}")
+        raise
     except ValueError as ve:
         logger.error(f"Value error: {ve}")
         raise
