@@ -15,18 +15,23 @@ logger = logging.getLogger("EtherTransfer")
 load_dotenv()
 
 # Retrieve environment variables
-INFURA_URL: Optional[str] = os.getenv("INFURA_URL")
-FROM_ADDRESS: Optional[str] = os.getenv("FROM_ADDRESS")
-TO_ADDRESS: Optional[str] = os.getenv("TO_ADDRESS")
-PRIVATE_KEY: Optional[str] = os.getenv("PRIVATE_KEY")
-DEFAULT_GAS_PRICE: Optional[int] = int(os.getenv("DEFAULT_GAS_PRICE", 0)) or None
+INFURA_URL = os.getenv("INFURA_URL")
+FROM_ADDRESS = os.getenv("FROM_ADDRESS")
+TO_ADDRESS = os.getenv("TO_ADDRESS")
+PRIVATE_KEY = os.getenv("PRIVATE_KEY")
+DEFAULT_GAS_PRICE = os.getenv("DEFAULT_GAS_PRICE")
 
+if DEFAULT_GAS_PRICE:
+    try:
+        DEFAULT_GAS_PRICE = int(DEFAULT_GAS_PRICE)
+    except ValueError:
+        logger.warning("Invalid DEFAULT_GAS_PRICE value. Using network gas price.")
+        DEFAULT_GAS_PRICE = None
 
 def validate_ethereum_address(address: Optional[str]) -> None:
     """Validate an Ethereum address."""
-    if not address or not Web3.isAddress(address):
+    if not address or not Web3.is_address(address):
         raise ValueError(f"Invalid Ethereum address: {address}")
-
 
 def validate_env_vars() -> None:
     """Ensure all required environment variables are present and valid."""
@@ -43,63 +48,35 @@ def validate_env_vars() -> None:
         logger.critical(error_message)
         raise EnvironmentError(error_message)
 
-    # Validate Ethereum addresses
     validate_ethereum_address(FROM_ADDRESS)
     validate_ethereum_address(TO_ADDRESS)
-
 
 # Validate environment variables
 validate_env_vars()
 
 # Connect to the Ethereum node
 web3 = Web3(Web3.HTTPProvider(INFURA_URL))
-
-if not web3.isConnected():
+if not web3.is_connected():
     logger.critical("Failed to connect to the Ethereum node. Check INFURA_URL.")
     raise ConnectionError("Failed to connect to the Ethereum node.")
 
-
-def send_ether(
-    from_address: str,
-    to_address: str,
-    private_key: str,
-    amount_ether: float
-) -> str:
-    """Send Ether from one address to another.
-
-    Args:
-        from_address (str): The sender's Ethereum address.
-        to_address (str): The receiver's Ethereum address.
-        private_key (str): The private key for the sender's address.
-        amount_ether (float): Amount of Ether to send.
-
-    Returns:
-        str: Transaction hash of the sent Ether.
-    """
+def send_ether(from_address: str, to_address: str, private_key: str, amount_ether: float) -> str:
+    """Send Ether from one address to another."""
     try:
-        # Convert Ether to Wei
         value = web3.to_wei(amount_ether, "ether")
-
-        # Check sender's balance
         balance = web3.eth.get_balance(from_address)
+        
         if balance < value:
-            logger.error("Insufficient balance for the transaction.")
             raise ValueError("Insufficient balance for the transaction.")
-
-        # Get the current transaction nonce
+        
         nonce = web3.eth.get_transaction_count(from_address)
-
-        # Determine gas price (use default or fetch from network)
         gas_price = DEFAULT_GAS_PRICE or web3.eth.gas_price
-
-        # Estimate gas limit dynamically
         estimated_gas = web3.eth.estimate_gas({
             "from": from_address,
             "to": to_address,
-            "value": value
+            "value": value,
         })
-
-        # Build the transaction
+        
         tx = {
             "nonce": nonce,
             "to": to_address,
@@ -107,20 +84,15 @@ def send_ether(
             "gas": estimated_gas,
             "gasPrice": gas_price,
         }
-
-        # Sign the transaction
+        
         signed_tx = web3.eth.account.sign_transaction(tx, private_key)
-
-        # Send the transaction and get the transaction hash
         tx_hash = web3.eth.send_raw_transaction(signed_tx.rawTransaction)
-
-        # Log the transaction hash
         tx_hash_hex = web3.to_hex(tx_hash)
+        
         logger.info(f"Transaction successful. Hash: {tx_hash_hex}")
         return tx_hash_hex
-
-    except exceptions.InsufficientFunds as e:
-        logger.error(f"Insufficient funds: {e}")
+    except exceptions.InsufficientFunds:
+        logger.error("Insufficient funds for transaction.")
         raise
     except ValueError as ve:
         logger.error(f"Value error: {ve}")
@@ -129,13 +101,10 @@ def send_ether(
         logger.error(f"Unexpected error while sending Ether: {e}", exc_info=True)
         raise
 
-
 if __name__ == "__main__":
     try:
-        amount_to_send = 0.01  # Define the amount of Ether to send
-        logger.info(
-            f"Starting Ether transfer: {amount_to_send} ETH from {FROM_ADDRESS} to {TO_ADDRESS}."
-        )
+        amount_to_send = 0.01
+        logger.info(f"Starting Ether transfer: {amount_to_send} ETH from {FROM_ADDRESS} to {TO_ADDRESS}.")
         tx_hash = send_ether(FROM_ADDRESS, TO_ADDRESS, PRIVATE_KEY, amount_to_send)
         logger.info(f"Transaction completed. Hash: {tx_hash}")
     except Exception as e:
