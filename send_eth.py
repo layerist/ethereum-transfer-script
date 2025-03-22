@@ -21,17 +21,19 @@ TO_ADDRESS = os.getenv("TO_ADDRESS")
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
 DEFAULT_GAS_PRICE = os.getenv("DEFAULT_GAS_PRICE")
 
-if DEFAULT_GAS_PRICE:
-    try:
-        DEFAULT_GAS_PRICE = int(DEFAULT_GAS_PRICE)
-    except ValueError:
-        logger.warning("Invalid DEFAULT_GAS_PRICE value. Using network gas price.")
-        DEFAULT_GAS_PRICE = None
-
 def validate_ethereum_address(address: Optional[str]) -> None:
     """Validate an Ethereum address."""
     if not address or not Web3.is_address(address):
         raise ValueError(f"Invalid Ethereum address: {address}")
+
+def get_gas_price(web3: Web3) -> int:
+    """Retrieve the gas price, either from environment or network."""
+    if DEFAULT_GAS_PRICE:
+        try:
+            return int(DEFAULT_GAS_PRICE)
+        except ValueError:
+            logger.warning("Invalid DEFAULT_GAS_PRICE value. Using network gas price.")
+    return web3.eth.gas_price
 
 def validate_env_vars() -> None:
     """Ensure all required environment variables are present and valid."""
@@ -65,34 +67,38 @@ def send_ether(from_address: str, to_address: str, private_key: str, amount_ethe
     try:
         value = web3.to_wei(amount_ether, "ether")
         balance = web3.eth.get_balance(from_address)
-        
+
         if balance < value:
             raise ValueError("Insufficient balance for the transaction.")
-        
+
         nonce = web3.eth.get_transaction_count(from_address)
-        gas_price = DEFAULT_GAS_PRICE or web3.eth.gas_price
+        gas_price = get_gas_price(web3)
         estimated_gas = web3.eth.estimate_gas({
             "from": from_address,
             "to": to_address,
             "value": value,
         })
-        
+
         tx = {
             "nonce": nonce,
             "to": to_address,
             "value": value,
             "gas": estimated_gas,
             "gasPrice": gas_price,
+            "chainId": web3.eth.chain_id,  # Ensure correct chain ID is included
         }
-        
+
         signed_tx = web3.eth.account.sign_transaction(tx, private_key)
         tx_hash = web3.eth.send_raw_transaction(signed_tx.rawTransaction)
         tx_hash_hex = web3.to_hex(tx_hash)
-        
+
         logger.info(f"Transaction successful. Hash: {tx_hash_hex}")
         return tx_hash_hex
     except exceptions.InsufficientFunds:
         logger.error("Insufficient funds for transaction.")
+        raise
+    except exceptions.TransactionNotFound:
+        logger.error("Transaction not found. Check the transaction hash.")
         raise
     except ValueError as ve:
         logger.error(f"Value error: {ve}")
@@ -104,8 +110,8 @@ def send_ether(from_address: str, to_address: str, private_key: str, amount_ethe
 if __name__ == "__main__":
     try:
         amount_to_send = 0.01
-        logger.info(f"Starting Ether transfer: {amount_to_send} ETH from {FROM_ADDRESS} to {TO_ADDRESS}.")
+        logger.info(f"Initiating Ether transfer: {amount_to_send} ETH from {FROM_ADDRESS} to {TO_ADDRESS}.")
         tx_hash = send_ether(FROM_ADDRESS, TO_ADDRESS, PRIVATE_KEY, amount_to_send)
-        logger.info(f"Transaction completed. Hash: {tx_hash}")
+        logger.info(f"Transaction completed successfully. Hash: {tx_hash}")
     except Exception as e:
-        logger.critical(f"Script terminated due to error: {e}", exc_info=True)
+        logger.critical(f"Script terminated due to an error: {e}", exc_info=True)
