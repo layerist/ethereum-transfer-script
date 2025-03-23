@@ -21,24 +21,36 @@ TO_ADDRESS = os.getenv("TO_ADDRESS")
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
 DEFAULT_GAS_PRICE = os.getenv("DEFAULT_GAS_PRICE")
 
+# Validate and initialize Web3 connection
+if not INFURA_URL:
+    logger.critical("INFURA_URL is missing from environment variables.")
+    raise EnvironmentError("INFURA_URL is required.")
+
+web3 = Web3(Web3.HTTPProvider(INFURA_URL))
+if not web3.is_connected():
+    logger.critical("Failed to connect to the Ethereum network. Check INFURA_URL.")
+    raise ConnectionError("Ethereum node connection failed.")
+
+
 def validate_ethereum_address(address: Optional[str]) -> None:
     """Validate an Ethereum address."""
     if not address or not Web3.is_address(address):
         raise ValueError(f"Invalid Ethereum address: {address}")
 
-def get_gas_price(web3: Web3) -> int:
+
+def get_gas_price() -> int:
     """Retrieve the gas price, either from environment or network."""
     if DEFAULT_GAS_PRICE:
         try:
             return int(DEFAULT_GAS_PRICE)
         except ValueError:
-            logger.warning("Invalid DEFAULT_GAS_PRICE value. Using network gas price.")
+            logger.warning("Invalid DEFAULT_GAS_PRICE. Using network gas price.")
     return web3.eth.gas_price
+
 
 def validate_env_vars() -> None:
     """Ensure all required environment variables are present and valid."""
     required_vars = {
-        "INFURA_URL": INFURA_URL,
         "FROM_ADDRESS": FROM_ADDRESS,
         "TO_ADDRESS": TO_ADDRESS,
         "PRIVATE_KEY": PRIVATE_KEY,
@@ -53,26 +65,20 @@ def validate_env_vars() -> None:
     validate_ethereum_address(FROM_ADDRESS)
     validate_ethereum_address(TO_ADDRESS)
 
-# Validate environment variables
+
 validate_env_vars()
 
-# Connect to the Ethereum node
-web3 = Web3(Web3.HTTPProvider(INFURA_URL))
-if not web3.is_connected():
-    logger.critical("Failed to connect to the Ethereum node. Check INFURA_URL.")
-    raise ConnectionError("Failed to connect to the Ethereum node.")
 
 def send_ether(from_address: str, to_address: str, private_key: str, amount_ether: float) -> str:
     """Send Ether from one address to another."""
     try:
         value = web3.to_wei(amount_ether, "ether")
         balance = web3.eth.get_balance(from_address)
-
         if balance < value:
-            raise ValueError("Insufficient balance for the transaction.")
+            raise ValueError("Insufficient balance for transaction.")
 
         nonce = web3.eth.get_transaction_count(from_address)
-        gas_price = get_gas_price(web3)
+        gas_price = get_gas_price()
         estimated_gas = web3.eth.estimate_gas({
             "from": from_address,
             "to": to_address,
@@ -85,7 +91,7 @@ def send_ether(from_address: str, to_address: str, private_key: str, amount_ethe
             "value": value,
             "gas": estimated_gas,
             "gasPrice": gas_price,
-            "chainId": web3.eth.chain_id,  # Ensure correct chain ID is included
+            "chainId": web3.eth.chain_id,
         }
 
         signed_tx = web3.eth.account.sign_transaction(tx, private_key)
@@ -106,6 +112,7 @@ def send_ether(from_address: str, to_address: str, private_key: str, amount_ethe
     except Exception as e:
         logger.error(f"Unexpected error while sending Ether: {e}", exc_info=True)
         raise
+
 
 if __name__ == "__main__":
     try:
