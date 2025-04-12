@@ -4,6 +4,9 @@ from web3 import Web3, exceptions
 from dotenv import load_dotenv
 from typing import Optional
 
+# Load environment variables
+load_dotenv()
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -11,114 +14,119 @@ logging.basicConfig(
 )
 logger = logging.getLogger("EtherTransfer")
 
-# Load environment variables
-load_dotenv()
-
-# Retrieve environment variables
+# Environment variables
 INFURA_URL = os.getenv("INFURA_URL")
 FROM_ADDRESS = os.getenv("FROM_ADDRESS")
 TO_ADDRESS = os.getenv("TO_ADDRESS")
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
 DEFAULT_GAS_PRICE = os.getenv("DEFAULT_GAS_PRICE")
 
-# Validate and initialize Web3 connection
+# Validate Infura URL and initialize Web3
 if not INFURA_URL:
-    logger.critical("INFURA_URL is missing from environment variables.")
+    logger.critical("INFURA_URL is missing in environment variables.")
     raise EnvironmentError("INFURA_URL is required.")
 
 web3 = Web3(Web3.HTTPProvider(INFURA_URL))
 if not web3.is_connected():
-    logger.critical("Failed to connect to the Ethereum network. Check INFURA_URL.")
-    raise ConnectionError("Ethereum node connection failed.")
+    logger.critical("Unable to connect to Ethereum network. Check your INFURA_URL.")
+    raise ConnectionError("Failed to connect to Ethereum node.")
 
 
 def validate_ethereum_address(address: Optional[str]) -> None:
-    """Validate an Ethereum address."""
+    """Validate the given Ethereum address."""
     if not address or not Web3.is_address(address):
         raise ValueError(f"Invalid Ethereum address: {address}")
 
 
 def get_gas_price() -> int:
-    """Retrieve the gas price, either from environment or network."""
+    """Return gas price from env or fetch current network price."""
     if DEFAULT_GAS_PRICE:
         try:
-            return int(DEFAULT_GAS_PRICE)
+            gas_price = int(DEFAULT_GAS_PRICE)
+            logger.debug(f"Using default gas price from .env: {gas_price}")
+            return gas_price
         except ValueError:
-            logger.warning("Invalid DEFAULT_GAS_PRICE. Using network gas price.")
+            logger.warning("DEFAULT_GAS_PRICE is invalid. Falling back to network gas price.")
     return web3.eth.gas_price
 
 
 def validate_env_vars() -> None:
-    """Ensure all required environment variables are present and valid."""
-    required_vars = {
+    """Ensure all critical environment variables are present and valid."""
+    required = {
         "FROM_ADDRESS": FROM_ADDRESS,
         "TO_ADDRESS": TO_ADDRESS,
         "PRIVATE_KEY": PRIVATE_KEY,
     }
 
-    missing_vars = [key for key, value in required_vars.items() if not value]
-    if missing_vars:
-        error_message = f"Missing required environment variables: {', '.join(missing_vars)}"
-        logger.critical(error_message)
-        raise EnvironmentError(error_message)
+    missing = [key for key, val in required.items() if not val]
+    if missing:
+        raise EnvironmentError(f"Missing environment variables: {', '.join(missing)}")
 
     validate_ethereum_address(FROM_ADDRESS)
     validate_ethereum_address(TO_ADDRESS)
 
 
-validate_env_vars()
+def send_ether(from_addr: str, to_addr: str, priv_key: str, amount_eth: float) -> str:
+    """Transfer Ether between accounts."""
+    value = web3.to_wei(amount_eth, "ether")
+    balance = web3.eth.get_balance(from_addr)
 
+    if balance < value:
+        raise ValueError("Insufficient balance for transaction.")
 
-def send_ether(from_address: str, to_address: str, private_key: str, amount_ether: float) -> str:
-    """Send Ether from one address to another."""
+    nonce = web3.eth.get_transaction_count(from_addr)
+    gas_price = get_gas_price()
+
     try:
-        value = web3.to_wei(amount_ether, "ether")
-        balance = web3.eth.get_balance(from_address)
-        if balance < value:
-            raise ValueError("Insufficient balance for transaction.")
-
-        nonce = web3.eth.get_transaction_count(from_address)
-        gas_price = get_gas_price()
         estimated_gas = web3.eth.estimate_gas({
-            "from": from_address,
-            "to": to_address,
+            "from": from_addr,
+            "to": to_addr,
             "value": value,
         })
+    except Exception as e:
+        logger.warning(f"Gas estimation failed: {e}. Using fallback gas limit of 21000.")
+        estimated_gas = 21000  # Standard for ETH transfers
 
-        tx = {
-            "nonce": nonce,
-            "to": to_address,
-            "value": value,
-            "gas": estimated_gas,
-            "gasPrice": gas_price,
-            "chainId": web3.eth.chain_id,
-        }
+    tx = {
+        "nonce": nonce,
+        "to": to_addr,
+        "value": value,
+        "gas": estimated_gas,
+        "gasPrice": gas_price,
+        "chainId": web3.eth.chain_id,
+    }
 
-        signed_tx = web3.eth.account.sign_transaction(tx, private_key)
+    try:
+        signed_tx = web3.eth.account.sign_transaction(tx, priv_key)
         tx_hash = web3.eth.send_raw_transaction(signed_tx.rawTransaction)
-        tx_hash_hex = web3.to_hex(tx_hash)
-
-        logger.info(f"Transaction successful. Hash: {tx_hash_hex}")
-        return tx_hash_hex
+        tx_hex = web3.to_hex(tx_hash)
+        logger.info(f"Transaction sent. Hash: {tx_hex}")
+        return tx_hex
     except exceptions.InsufficientFunds:
-        logger.error("Insufficient funds for transaction.")
+        logger.error("Insufficient funds for gas.")
         raise
     except exceptions.TransactionNotFound:
-        logger.error("Transaction not found. Check the transaction hash.")
+        logger.error("Transaction not found after broadcasting.")
         raise
     except ValueError as ve:
-        logger.error(f"Value error: {ve}")
+        logger.error(f"Value error during transaction: {ve}")
         raise
     except Exception as e:
-        logger.error(f"Unexpected error while sending Ether: {e}", exc_info=True)
+        logger.error("Unexpected error during transaction.", exc_info=True)
         raise
+
+
+def main():
+    """Entry point for ETH transfer."""
+    try:
+        validate_env_vars()
+        amount = 0.01
+        logger.info(f"Sending {amount} ETH from {FROM_ADDRESS} to {TO_ADDRESS}...")
+        tx_hash = send_ether(FROM_ADDRESS, TO_ADDRESS, PRIVATE_KEY, amount)
+        logger.info(f"Transfer successful. Transaction hash: {tx_hash}")
+    except Exception as e:
+        logger.critical(f"Transaction failed: {e}", exc_info=True)
 
 
 if __name__ == "__main__":
-    try:
-        amount_to_send = 0.01
-        logger.info(f"Initiating Ether transfer: {amount_to_send} ETH from {FROM_ADDRESS} to {TO_ADDRESS}.")
-        tx_hash = send_ether(FROM_ADDRESS, TO_ADDRESS, PRIVATE_KEY, amount_to_send)
-        logger.info(f"Transaction completed successfully. Hash: {tx_hash}")
-    except Exception as e:
-        logger.critical(f"Script terminated due to an error: {e}", exc_info=True)
+    main()
