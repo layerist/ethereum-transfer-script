@@ -1,6 +1,7 @@
 import os
 import logging
-from typing import Optional
+import time
+from typing import Optional, Dict, Any
 from dotenv import load_dotenv
 from web3 import Web3, exceptions
 from web3.middleware import geth_poa_middleware
@@ -16,7 +17,10 @@ logging.basicConfig(
 logger = logging.getLogger("EtherTransfer")
 
 # Constants
-DEFAULT_GAS_LIMIT = 21_000
+DEFAULT_GAS_LIMIT: int = 21_000
+DEFAULT_AMOUNT_ETH: float = 0.01
+GAS_RETRY_ATTEMPTS: int = 3
+GAS_RETRY_DELAY: int = 2  # seconds
 
 # Environment variables
 INFURA_URL: Optional[str] = os.getenv("INFURA_URL")
@@ -60,9 +64,13 @@ def check_required_env_vars() -> None:
     validate_eth_address(FROM_ADDRESS, "FROM_ADDRESS")
     validate_eth_address(TO_ADDRESS, "TO_ADDRESS")
 
+    if PRIVATE_KEY and PRIVATE_KEY.startswith("0x"):
+        logger.warning("PRIVATE_KEY loaded from environment. "
+                       "Make sure this is not committed to version control.")
+
 
 def get_gas_price() -> int:
-    """Return gas price (custom or network)."""
+    """Return gas price (custom or network with retries)."""
     if DEFAULT_GAS_PRICE:
         try:
             gas_price = int(DEFAULT_GAS_PRICE)
@@ -71,13 +79,16 @@ def get_gas_price() -> int:
         except ValueError:
             logger.warning("Invalid DEFAULT_GAS_PRICE format. Falling back to network value.")
 
-    try:
-        gas_price = web3.eth.gas_price
-        logger.debug(f"Using network gas price: {gas_price} wei")
-        return gas_price
-    except Exception as e:
-        logger.error(f"Failed to fetch gas price: {e}")
-        raise
+    for attempt in range(GAS_RETRY_ATTEMPTS):
+        try:
+            gas_price = web3.eth.gas_price
+            logger.debug(f"Using network gas price: {gas_price} wei")
+            return gas_price
+        except Exception as e:
+            logger.error(f"Failed to fetch gas price (attempt {attempt + 1}): {e}")
+            if attempt < GAS_RETRY_ATTEMPTS - 1:
+                time.sleep(GAS_RETRY_DELAY)
+    raise RuntimeError("Failed to fetch gas price after multiple attempts.")
 
 
 def estimate_gas_limit(from_addr: str, to_addr: str, value: int) -> int:
@@ -93,6 +104,19 @@ def estimate_gas_limit(from_addr: str, to_addr: str, value: int) -> int:
         return DEFAULT_GAS_LIMIT
 
 
+def build_transaction(from_addr: str, to_addr: str, value_wei: int,
+                      gas_price: int, gas_limit: int) -> Dict[str, Any]:
+    """Build raw transaction dict."""
+    return {
+        "nonce": web3.eth.get_transaction_count(from_addr),
+        "to": to_addr,
+        "value": value_wei,
+        "gas": gas_limit,
+        "gasPrice": gas_price,
+        "chainId": web3.eth.chain_id,
+    }
+
+
 def send_eth(from_addr: str, to_addr: str, priv_key: str, amount_eth: float) -> str:
     """Send ETH and return transaction hash."""
     value_wei = web3.to_wei(amount_eth, "ether")
@@ -104,18 +128,9 @@ def send_eth(from_addr: str, to_addr: str, priv_key: str, amount_eth: float) -> 
             f"Required: {amount_eth} ETH, Available: {web3.from_wei(balance, 'ether')} ETH"
         )
 
-    nonce = web3.eth.get_transaction_count(from_addr)
     gas_price = get_gas_price()
     gas_limit = estimate_gas_limit(from_addr, to_addr, value_wei)
-
-    tx = {
-        "nonce": nonce,
-        "to": to_addr,
-        "value": value_wei,
-        "gas": gas_limit,
-        "gasPrice": gas_price,
-        "chainId": web3.eth.chain_id,
-    }
+    tx = build_transaction(from_addr, to_addr, value_wei, gas_price, gas_limit)
 
     try:
         signed_tx = web3.eth.account.sign_transaction(tx, priv_key)
@@ -134,9 +149,9 @@ def main() -> None:
     """Main entry point."""
     try:
         check_required_env_vars()
-        amount = float(TRANSFER_AMOUNT) if TRANSFER_AMOUNT else 0.01
+        amount = float(TRANSFER_AMOUNT) if TRANSFER_AMOUNT else DEFAULT_AMOUNT_ETH
         logger.info(f"Sending {amount:.6f} ETH from {FROM_ADDRESS} to {TO_ADDRESS}")
-        tx_hash = send_eth(FROM_ADDRESS, TO_ADDRESS, PRIVATE_KEY, amount)
+        tx_hash = send_eth(FROM_ADDRESS, TO_ADDRESS, PRIVATE_KEY, amount)  # type: ignore
         logger.info(f"Transaction successful: {tx_hash}")
     except Exception as e:
         logger.critical(f"Execution failed: {e}", exc_info=True)
