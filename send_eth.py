@@ -21,6 +21,8 @@ DEFAULT_GAS_LIMIT: int = 21_000
 DEFAULT_AMOUNT_ETH: float = 0.01
 GAS_RETRY_ATTEMPTS: int = 3
 GAS_RETRY_DELAY: int = 2  # seconds
+NONCE_RETRY_ATTEMPTS: int = 3
+NONCE_RETRY_DELAY: int = 1  # seconds
 
 # Environment variables
 INFURA_URL: Optional[str] = os.getenv("INFURA_URL")
@@ -66,7 +68,7 @@ def check_required_env_vars() -> None:
 
     if PRIVATE_KEY and PRIVATE_KEY.startswith("0x"):
         logger.warning("PRIVATE_KEY loaded from environment. "
-                       "Make sure this is not committed to version control.")
+                       "Make sure this is never exposed in logs or version control.")
 
 
 def get_gas_price() -> int:
@@ -74,6 +76,8 @@ def get_gas_price() -> int:
     if DEFAULT_GAS_PRICE:
         try:
             gas_price = int(DEFAULT_GAS_PRICE)
+            if gas_price <= 0:
+                raise ValueError("Gas price must be positive")
             logger.debug(f"Using custom gas price: {gas_price} wei")
             return gas_price
         except ValueError:
@@ -104,11 +108,23 @@ def estimate_gas_limit(from_addr: str, to_addr: str, value: int) -> int:
         return DEFAULT_GAS_LIMIT
 
 
+def get_nonce(address: str) -> int:
+    """Get transaction nonce with retry to handle race conditions."""
+    for attempt in range(NONCE_RETRY_ATTEMPTS):
+        try:
+            return web3.eth.get_transaction_count(address)
+        except Exception as e:
+            logger.error(f"Failed to fetch nonce (attempt {attempt + 1}): {e}")
+            if attempt < NONCE_RETRY_ATTEMPTS - 1:
+                time.sleep(NONCE_RETRY_DELAY)
+    raise RuntimeError("Failed to fetch nonce after multiple attempts.")
+
+
 def build_transaction(from_addr: str, to_addr: str, value_wei: int,
                       gas_price: int, gas_limit: int) -> Dict[str, Any]:
     """Build raw transaction dict."""
     return {
-        "nonce": web3.eth.get_transaction_count(from_addr),
+        "nonce": get_nonce(from_addr),
         "to": to_addr,
         "value": value_wei,
         "gas": gas_limit,
@@ -140,6 +156,10 @@ def send_eth(from_addr: str, to_addr: str, priv_key: str, amount_eth: float) -> 
         return tx_hex
     except exceptions.InsufficientFunds:
         raise ValueError("Insufficient ETH to cover gas fees.")
+    except ValueError as e:
+        if "nonce too low" in str(e).lower():
+            logger.error("Nonce too low. Try again with a higher nonce.")
+        raise
     except Exception as e:
         logger.exception(f"Transaction failed: {e}")
         raise
@@ -150,11 +170,15 @@ def main() -> None:
     try:
         check_required_env_vars()
         amount = float(TRANSFER_AMOUNT) if TRANSFER_AMOUNT else DEFAULT_AMOUNT_ETH
+        if amount <= 0:
+            raise ValueError("TRANSFER_AMOUNT must be positive.")
+
         logger.info(f"Sending {amount:.6f} ETH from {FROM_ADDRESS} to {TO_ADDRESS}")
         tx_hash = send_eth(FROM_ADDRESS, TO_ADDRESS, PRIVATE_KEY, amount)  # type: ignore
         logger.info(f"Transaction successful: {tx_hash}")
     except Exception as e:
         logger.critical(f"Execution failed: {e}", exc_info=True)
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
