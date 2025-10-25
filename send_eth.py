@@ -1,185 +1,178 @@
 import os
-import logging
+import sys
 import time
+import logging
 from typing import Optional, Dict, Any
 from dotenv import load_dotenv
 from web3 import Web3, exceptions
 from web3.middleware import geth_poa_middleware
 
-# Load environment variables
+# === Environment Setup ===
 load_dotenv()
 
-# Logging configuration
+# === Logging Configuration ===
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s"
+    format="\033[94m%(asctime)s\033[0m - %(levelname)s - %(name)s - %(message)s"
 )
 logger = logging.getLogger("EtherTransfer")
 
-# Constants
-DEFAULT_GAS_LIMIT: int = 21_000
-DEFAULT_AMOUNT_ETH: float = 0.01
-GAS_RETRY_ATTEMPTS: int = 3
-GAS_RETRY_DELAY: int = 2  # seconds
-NONCE_RETRY_ATTEMPTS: int = 3
-NONCE_RETRY_DELAY: int = 1  # seconds
-
-# Environment variables
-INFURA_URL: Optional[str] = os.getenv("INFURA_URL")
-FROM_ADDRESS: Optional[str] = os.getenv("FROM_ADDRESS")
-TO_ADDRESS: Optional[str] = os.getenv("TO_ADDRESS")
-PRIVATE_KEY: Optional[str] = os.getenv("PRIVATE_KEY")
-DEFAULT_GAS_PRICE: Optional[str] = os.getenv("DEFAULT_GAS_PRICE")
-TRANSFER_AMOUNT: Optional[str] = os.getenv("TRANSFER_AMOUNT")
-
-# Validate connection URL
-if not INFURA_URL:
-    logger.critical("INFURA_URL is missing in environment variables.")
-    raise EnvironmentError("INFURA_URL must be set in .env")
-
-# Initialize Web3
-web3 = Web3(Web3.HTTPProvider(INFURA_URL))
-web3.middleware_onion.inject(geth_poa_middleware, layer=0)
-
-if not web3.is_connected():
-    logger.critical("Failed to connect to Ethereum network.")
-    raise ConnectionError("Web3 provider connection failed.")
+# === Constants ===
+DEFAULT_GAS_LIMIT = 21_000
+DEFAULT_AMOUNT_ETH = 0.01
+RETRY_ATTEMPTS = 3
+RETRY_DELAY = 2  # seconds
 
 
-def validate_eth_address(address: Optional[str], label: str) -> None:
-    """Validate Ethereum address format."""
-    if not address or not Web3.is_address(address):
-        raise ValueError(f"{label} is invalid or missing: {address}")
+class EtherTransfer:
+    """Ethereum ETH transfer utility using Web3 and Infura."""
 
+    def __init__(self):
+        self.infura_url = os.getenv("INFURA_URL")
+        self.from_address = os.getenv("FROM_ADDRESS")
+        self.to_address = os.getenv("TO_ADDRESS")
+        self.private_key = os.getenv("PRIVATE_KEY")
+        self.custom_gas_price = os.getenv("DEFAULT_GAS_PRICE")
+        self.transfer_amount = os.getenv("TRANSFER_AMOUNT")
 
-def check_required_env_vars() -> None:
-    """Ensure required environment variables are present and valid."""
-    required = {
-        "FROM_ADDRESS": FROM_ADDRESS,
-        "TO_ADDRESS": TO_ADDRESS,
-        "PRIVATE_KEY": PRIVATE_KEY,
-    }
-    missing = [name for name, val in required.items() if not val]
-    if missing:
-        raise EnvironmentError(f"Missing environment variables: {', '.join(missing)}")
+        if not self.infura_url:
+            logger.critical("Missing INFURA_URL in environment variables.")
+            sys.exit(1)
 
-    validate_eth_address(FROM_ADDRESS, "FROM_ADDRESS")
-    validate_eth_address(TO_ADDRESS, "TO_ADDRESS")
+        self.web3 = Web3(Web3.HTTPProvider(self.infura_url))
+        self.web3.middleware_onion.inject(geth_poa_middleware, layer=0)
 
-    if PRIVATE_KEY and PRIVATE_KEY.startswith("0x"):
-        logger.warning("PRIVATE_KEY loaded from environment. "
-                       "Make sure this is never exposed in logs or version control.")
+        if not self.web3.is_connected():
+            logger.critical("Unable to connect to Ethereum network.")
+            sys.exit(1)
 
+        self._validate_env()
 
-def get_gas_price() -> int:
-    """Return gas price (custom or network with retries)."""
-    if DEFAULT_GAS_PRICE:
+    def _validate_env(self) -> None:
+        """Validate required environment variables and addresses."""
+        required_vars = {
+            "FROM_ADDRESS": self.from_address,
+            "TO_ADDRESS": self.to_address,
+            "PRIVATE_KEY": self.private_key,
+        }
+        missing = [k for k, v in required_vars.items() if not v]
+        if missing:
+            raise EnvironmentError(f"Missing environment variables: {', '.join(missing)}")
+
+        for label, addr in [("FROM_ADDRESS", self.from_address), ("TO_ADDRESS", self.to_address)]:
+            if not Web3.is_address(addr):
+                raise ValueError(f"{label} is invalid: {addr}")
+
+        if self.private_key.startswith("0x"):
+            logger.debug("Private key loaded. Ensure it's securely stored and never logged.")
+
+    def _retry(self, func, *args, label: str = "", **kwargs):
+        """Generic retry wrapper for network operations."""
+        for attempt in range(RETRY_ATTEMPTS):
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                logger.warning(f"{label} failed (attempt {attempt + 1}/{RETRY_ATTEMPTS}): {e}")
+                if attempt < RETRY_ATTEMPTS - 1:
+                    time.sleep(RETRY_DELAY)
+        raise RuntimeError(f"{label} failed after {RETRY_ATTEMPTS} attempts.")
+
+    def get_gas_price(self) -> Dict[str, int]:
+        """Return EIP-1559 gas settings or legacy gas price."""
+        if self.custom_gas_price:
+            try:
+                gas_price = int(self.custom_gas_price)
+                if gas_price <= 0:
+                    raise ValueError
+                logger.info(f"Using custom gas price: {gas_price} wei")
+                return {"gasPrice": gas_price}
+            except ValueError:
+                logger.warning("Invalid DEFAULT_GAS_PRICE. Falling back to network price.")
+
+        # Try EIP-1559 dynamic fee
         try:
-            gas_price = int(DEFAULT_GAS_PRICE)
-            if gas_price <= 0:
-                raise ValueError("Gas price must be positive")
-            logger.debug(f"Using custom gas price: {gas_price} wei")
-            return gas_price
-        except ValueError:
-            logger.warning("Invalid DEFAULT_GAS_PRICE format. Falling back to network value.")
+            base_fee = self.web3.eth.fee_history(1, "latest")["baseFeePerGas"][-1]
+            max_priority_fee = self.web3.to_wei("2", "gwei")
+            max_fee = base_fee + max_priority_fee
+            logger.info(f"Using dynamic fees: base={base_fee}, max={max_fee}")
+            return {"maxFeePerGas": max_fee, "maxPriorityFeePerGas": max_priority_fee}
+        except Exception:
+            logger.debug("EIP-1559 not supported. Using legacy gas price.")
 
-    for attempt in range(GAS_RETRY_ATTEMPTS):
+        # Fallback: legacy gas price
+        gas_price = self._retry(self.web3.eth.gas_price, label="Fetch gas price")
+        return {"gasPrice": gas_price}
+
+    def estimate_gas_limit(self, from_addr: str, to_addr: str, value: int) -> int:
+        """Estimate gas limit or return fallback."""
         try:
-            gas_price = web3.eth.gas_price
-            logger.debug(f"Using network gas price: {gas_price} wei")
-            return gas_price
+            return self.web3.eth.estimate_gas({"from": from_addr, "to": to_addr, "value": value})
         except Exception as e:
-            logger.error(f"Failed to fetch gas price (attempt {attempt + 1}): {e}")
-            if attempt < GAS_RETRY_ATTEMPTS - 1:
-                time.sleep(GAS_RETRY_DELAY)
-    raise RuntimeError("Failed to fetch gas price after multiple attempts.")
+            logger.warning(f"Gas estimation failed: {e}. Using fallback {DEFAULT_GAS_LIMIT}.")
+            return DEFAULT_GAS_LIMIT
 
+    def get_nonce(self, address: str) -> int:
+        """Get nonce with retry."""
+        return self._retry(self.web3.eth.get_transaction_count, address, label="Get nonce")
 
-def estimate_gas_limit(from_addr: str, to_addr: str, value: int) -> int:
-    """Estimate gas usage, fallback if it fails."""
-    try:
-        return web3.eth.estimate_gas({
-            "from": from_addr,
-            "to": to_addr,
-            "value": value,
-        })
-    except Exception as e:
-        logger.warning(f"Gas estimation failed: {e}. Using fallback {DEFAULT_GAS_LIMIT}.")
-        return DEFAULT_GAS_LIMIT
+    def build_transaction(self, value_wei: int, gas_params: Dict[str, int]) -> Dict[str, Any]:
+        """Build transaction dictionary."""
+        nonce = self.get_nonce(self.from_address)
+        gas_limit = self.estimate_gas_limit(self.from_address, self.to_address, value_wei)
 
+        tx = {
+            "nonce": nonce,
+            "to": self.to_address,
+            "value": value_wei,
+            "gas": gas_limit,
+            "chainId": self.web3.eth.chain_id,
+        }
+        tx.update(gas_params)
+        return tx
 
-def get_nonce(address: str) -> int:
-    """Get transaction nonce with retry to handle race conditions."""
-    for attempt in range(NONCE_RETRY_ATTEMPTS):
+    def send_eth(self, amount_eth: float) -> str:
+        """Send ETH and return tx hash."""
+        value_wei = self.web3.to_wei(amount_eth, "ether")
+        balance = self.web3.eth.get_balance(self.from_address)
+        if balance < value_wei:
+            raise ValueError(
+                f"Insufficient funds. Required {amount_eth} ETH, "
+                f"available {self.web3.from_wei(balance, 'ether')} ETH."
+            )
+
+        gas_params = self.get_gas_price()
+        tx = self.build_transaction(value_wei, gas_params)
+
         try:
-            return web3.eth.get_transaction_count(address)
+            signed_tx = self.web3.eth.account.sign_transaction(tx, self.private_key)
+            tx_hash = self.web3.eth.send_raw_transaction(signed_tx.rawTransaction)
+            tx_hex = self.web3.to_hex(tx_hash)
+            logger.info(f"✅ Transaction submitted: {tx_hex}")
+            return tx_hex
+        except exceptions.InsufficientFunds:
+            raise ValueError("Not enough ETH to cover gas fees.")
+        except ValueError as e:
+            if "nonce too low" in str(e).lower():
+                logger.error("Nonce too low. Try resending with higher nonce.")
+            raise
         except Exception as e:
-            logger.error(f"Failed to fetch nonce (attempt {attempt + 1}): {e}")
-            if attempt < NONCE_RETRY_ATTEMPTS - 1:
-                time.sleep(NONCE_RETRY_DELAY)
-    raise RuntimeError("Failed to fetch nonce after multiple attempts.")
+            logger.exception(f"Transaction failed: {e}")
+            raise
 
+    def run(self) -> None:
+        """Execute ETH transfer."""
+        try:
+            amount = float(self.transfer_amount) if self.transfer_amount else DEFAULT_AMOUNT_ETH
+            if amount <= 0:
+                raise ValueError("TRANSFER_AMOUNT must be positive.")
 
-def build_transaction(from_addr: str, to_addr: str, value_wei: int,
-                      gas_price: int, gas_limit: int) -> Dict[str, Any]:
-    """Build raw transaction dict."""
-    return {
-        "nonce": get_nonce(from_addr),
-        "to": to_addr,
-        "value": value_wei,
-        "gas": gas_limit,
-        "gasPrice": gas_price,
-        "chainId": web3.eth.chain_id,
-    }
-
-
-def send_eth(from_addr: str, to_addr: str, priv_key: str, amount_eth: float) -> str:
-    """Send ETH and return transaction hash."""
-    value_wei = web3.to_wei(amount_eth, "ether")
-    balance = web3.eth.get_balance(from_addr)
-
-    if balance < value_wei:
-        raise ValueError(
-            f"Insufficient funds. "
-            f"Required: {amount_eth} ETH, Available: {web3.from_wei(balance, 'ether')} ETH"
-        )
-
-    gas_price = get_gas_price()
-    gas_limit = estimate_gas_limit(from_addr, to_addr, value_wei)
-    tx = build_transaction(from_addr, to_addr, value_wei, gas_price, gas_limit)
-
-    try:
-        signed_tx = web3.eth.account.sign_transaction(tx, priv_key)
-        tx_hash = web3.eth.send_raw_transaction(signed_tx.rawTransaction)
-        tx_hex = web3.to_hex(tx_hash)
-        logger.info(f"Transaction submitted: {tx_hex}")
-        return tx_hex
-    except exceptions.InsufficientFunds:
-        raise ValueError("Insufficient ETH to cover gas fees.")
-    except ValueError as e:
-        if "nonce too low" in str(e).lower():
-            logger.error("Nonce too low. Try again with a higher nonce.")
-        raise
-    except Exception as e:
-        logger.exception(f"Transaction failed: {e}")
-        raise
-
-
-def main() -> None:
-    """Main entry point."""
-    try:
-        check_required_env_vars()
-        amount = float(TRANSFER_AMOUNT) if TRANSFER_AMOUNT else DEFAULT_AMOUNT_ETH
-        if amount <= 0:
-            raise ValueError("TRANSFER_AMOUNT must be positive.")
-
-        logger.info(f"Sending {amount:.6f} ETH from {FROM_ADDRESS} to {TO_ADDRESS}")
-        tx_hash = send_eth(FROM_ADDRESS, TO_ADDRESS, PRIVATE_KEY, amount)  # type: ignore
-        logger.info(f"Transaction successful: {tx_hash}")
-    except Exception as e:
-        logger.critical(f"Execution failed: {e}", exc_info=True)
-        raise SystemExit(1)
+            logger.info(f"Initiating transfer of {amount:.6f} ETH...")
+            tx_hash = self.send_eth(amount)
+            logger.info(f"✅ Transfer complete: {tx_hash}")
+        except Exception as e:
+            logger.critical(f"❌ Execution failed: {e}", exc_info=True)
+            sys.exit(1)
 
 
 if __name__ == "__main__":
-    main()
+    EtherTransfer().run()
