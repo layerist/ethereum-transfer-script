@@ -2,29 +2,31 @@
 """
 Robust ETH transfer utility using Web3.py.
 
-Improvements:
-- Stricter input validation
-- Clear separation of concerns
-- Safer gas cost calculation
-- Better EIP-1559 handling
-- Type hints and docstrings everywhere
-- Reduced hidden side effects
+Features:
+- Strict environment validation
+- EIP-1559 first, legacy fallback
+- Safe gas headroom calculation
+- Deterministic retry logic
+- Explicit error boundaries
 """
+
+from __future__ import annotations
 
 import os
 import sys
 import time
 import logging
-from typing import Optional, Dict, Any, Callable
+from typing import Any, Callable, Dict, Optional
 
 from dotenv import load_dotenv
-from web3 import Web3, exceptions
+from web3 import Web3
 from web3.middleware import geth_poa_middleware
+from web3.exceptions import InsufficientFunds
 
 
-# =========================
+# ==================================================
 # Logging
-# =========================
+# ==================================================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -32,19 +34,21 @@ logging.basicConfig(
 logger = logging.getLogger("EtherTransfer")
 
 
-# =========================
+# ==================================================
 # Constants
-# =========================
+# ==================================================
 DEFAULT_AMOUNT_ETH = 0.01
 DEFAULT_GAS_LIMIT = 21_000
+DEFAULT_PRIORITY_FEE_GWEI = 2
+EIP1559_FEE_MULTIPLIER = 2  # baseFee * multiplier
+
 RETRY_ATTEMPTS = 3
 RETRY_DELAY_SEC = 2
-DEFAULT_PRIORITY_FEE_GWEI = 2
 
 
-# =========================
-# Helpers
-# =========================
+# ==================================================
+# Utilities
+# ==================================================
 def env_required(name: str) -> str:
     """Read required environment variable or exit."""
     value = os.getenv(name)
@@ -55,7 +59,7 @@ def env_required(name: str) -> str:
 
 
 def parse_positive_float(value: Optional[str], default: float) -> float:
-    """Parse a positive float or return default."""
+    """Parse positive float or return default."""
     if not value:
         return default
     try:
@@ -68,10 +72,10 @@ def parse_positive_float(value: Optional[str], default: float) -> float:
 def retry(
     func: Callable[..., Any],
     label: str,
-    *args,
-    **kwargs,
+    *args: Any,
+    **kwargs: Any,
 ) -> Any:
-    """Generic retry wrapper with logging."""
+    """Retry wrapper with logging."""
     for attempt in range(1, RETRY_ATTEMPTS + 1):
         try:
             return func(*args, **kwargs)
@@ -88,91 +92,100 @@ def retry(
     raise RuntimeError(f"{label} failed after {RETRY_ATTEMPTS} attempts")
 
 
-# =========================
-# Main Class
-# =========================
+# ==================================================
+# Main class
+# ==================================================
 class EtherTransfer:
-    """Utility class for sending ETH transactions."""
+    """Utility class for sending ETH safely."""
 
     def __init__(self) -> None:
         load_dotenv()
 
-        # Required config
-        self.infura_url: str = env_required("INFURA_URL")
-        self.from_address: str = Web3.to_checksum_address(env_required("FROM_ADDRESS"))
-        self.to_address: str = Web3.to_checksum_address(env_required("TO_ADDRESS"))
-        self.private_key: str = env_required("PRIVATE_KEY")
+        self.infura_url = env_required("INFURA_URL")
+        self.from_address = Web3.to_checksum_address(env_required("FROM_ADDRESS"))
+        self.to_address = Web3.to_checksum_address(env_required("TO_ADDRESS"))
+        self.private_key = env_required("PRIVATE_KEY")
 
-        # Optional config
-        self.transfer_amount_eth: float = parse_positive_float(
+        self.amount_eth = parse_positive_float(
             os.getenv("TRANSFER_AMOUNT"),
             DEFAULT_AMOUNT_ETH,
         )
-        self.custom_gas_price_wei: Optional[int] = self._parse_custom_gas_price(
+
+        self.custom_gas_price_wei = self._parse_custom_gas_price(
             os.getenv("DEFAULT_GAS_PRICE")
         )
 
-        # Web3 setup
-        self.web3 = Web3(Web3.HTTPProvider(self.infura_url, request_kwargs={"timeout": 30}))
-        self.web3.middleware_onion.inject(geth_poa_middleware, layer=0)
+        self.web3 = self._init_web3()
+        self._validate_inputs()
 
-        if not self.web3.is_connected():
+    # --------------------------------------------------
+    def _init_web3(self) -> Web3:
+        web3 = Web3(
+            Web3.HTTPProvider(
+                self.infura_url,
+                request_kwargs={"timeout": 30},
+            )
+        )
+        web3.middleware_onion.inject(geth_poa_middleware, layer=0)
+
+        if not web3.is_connected():
             logger.critical("Failed to connect to Ethereum node.")
             sys.exit(1)
 
-        self._validate_inputs()
+        return web3
 
-    # ---------------------------------------------------------
-    def _parse_custom_gas_price(self, value: Optional[str]) -> Optional[int]:
+    # --------------------------------------------------
+    @staticmethod
+    def _parse_custom_gas_price(value: Optional[str]) -> Optional[int]:
         if not value:
             return None
         try:
             gas_price = int(value)
             return gas_price if gas_price > 0 else None
         except ValueError:
-            logger.warning("Invalid DEFAULT_GAS_PRICE value, ignoring.")
+            logger.warning("Invalid DEFAULT_GAS_PRICE, ignoring.")
             return None
 
-    # ---------------------------------------------------------
+    # --------------------------------------------------
     def _validate_inputs(self) -> None:
-        if not self.private_key:
-            raise ValueError("PRIVATE_KEY must not be empty")
-        if self.transfer_amount_eth <= 0:
+        if self.amount_eth <= 0:
             raise ValueError("TRANSFER_AMOUNT must be positive")
 
-        logger.debug("Input validation passed.")
-
-    # ---------------------------------------------------------
-    # Gas logic
-    # ---------------------------------------------------------
+    # ==================================================
+    # Gas handling
+    # ==================================================
     def get_gas_params(self) -> Dict[str, int]:
-        """Return gas parameters (EIP-1559 preferred, legacy fallback)."""
+        """Return gas parameters (EIP-1559 preferred)."""
 
-        # Custom legacy gas price
         if self.custom_gas_price_wei:
-            logger.info("Using custom gas price: %d wei", self.custom_gas_price_wei)
+            logger.info("Using custom legacy gas price: %d wei", self.custom_gas_price_wei)
             return {"gasPrice": self.custom_gas_price_wei}
 
-        # Try EIP-1559
         try:
-            latest_block = self.web3.eth.get_block("latest")
-            base_fee = latest_block.get("baseFeePerGas")
+            block = self.web3.eth.get_block("latest")
+            base_fee = block.get("baseFeePerGas")
+
             if base_fee is not None:
-                priority_fee = self.web3.to_wei(DEFAULT_PRIORITY_FEE_GWEI, "gwei")
+                priority_fee = self.web3.to_wei(
+                    DEFAULT_PRIORITY_FEE_GWEI,
+                    "gwei",
+                )
+                max_fee = base_fee * EIP1559_FEE_MULTIPLIER + priority_fee
+
                 return {
-                    "maxFeePerGas": base_fee + priority_fee,
+                    "maxFeePerGas": max_fee,
                     "maxPriorityFeePerGas": priority_fee,
                 }
-        except Exception as exc:
-            logger.debug("EIP-1559 gas fetch failed: %s", exc)
 
-        # Legacy fallback
-        gas_price = retry(self.web3.eth.gas_price, "Fetch gas price")
+        except Exception as exc:
+            logger.debug("EIP-1559 gas calculation failed: %s", exc)
+
+        gas_price = retry(self.web3.eth.gas_price, "Fetch legacy gas price")
         return {"gasPrice": gas_price}
 
-    # ---------------------------------------------------------
-    # Blockchain helpers
-    # ---------------------------------------------------------
+    # ==================================================
+    # Transaction helpers
+    # ==================================================
     def get_nonce(self) -> int:
         return retry(
             self.web3.eth.get_transaction_count,
@@ -198,7 +211,6 @@ class EtherTransfer:
             )
             return DEFAULT_GAS_LIMIT
 
-    # ---------------------------------------------------------
     def build_transaction(
         self,
         value_wei: int,
@@ -213,61 +225,61 @@ class EtherTransfer:
             **gas_params,
         }
 
-    # ---------------------------------------------------------
-    def _estimate_total_cost(
-        self,
-        tx: Dict[str, Any],
-    ) -> int:
+    # --------------------------------------------------
+    @staticmethod
+    def estimate_total_cost(tx: Dict[str, Any]) -> int:
         gas_limit = tx["gas"]
-        gas_price = (
-            tx.get("maxFeePerGas")
-            or tx.get("gasPrice")
-            or 0
-        )
+        gas_price = tx.get("maxFeePerGas") or tx.get("gasPrice") or 0
         return gas_limit * gas_price + tx["value"]
 
-    # ---------------------------------------------------------
-    def send_eth(self) -> str:
-        value_wei = self.web3.to_wei(self.transfer_amount_eth, "ether")
+    # ==================================================
+    # Execution
+    # ==================================================
+    def send(self) -> str:
+        value_wei = self.web3.to_wei(self.amount_eth, "ether")
 
         gas_params = self.get_gas_params()
         tx = self.build_transaction(value_wei, gas_params)
 
         balance = self.web3.eth.get_balance(self.from_address)
-        required = self._estimate_total_cost(tx)
+        required = self.estimate_total_cost(tx)
 
         if balance < required:
             raise ValueError(
-                f"Insufficient balance. Required: {required}, balance: {balance}"
+                f"Insufficient balance. Required={required}, balance={balance}"
             )
 
         try:
-            signed_tx = self.web3.eth.account.sign_transaction(tx, self.private_key)
-            tx_hash = self.web3.eth.send_raw_transaction(signed_tx.rawTransaction)
+            signed = self.web3.eth.account.sign_transaction(tx, self.private_key)
+            tx_hash = self.web3.eth.send_raw_transaction(signed.rawTransaction)
             hex_hash = self.web3.to_hex(tx_hash)
-            logger.info("Transaction sent: %s", hex_hash)
+
+            logger.info("Transaction broadcasted: %s", hex_hash)
             return hex_hash
 
-        except exceptions.InsufficientFunds:
+        except InsufficientFunds:
             raise ValueError("Insufficient funds to cover gas.")
         except Exception:
             logger.exception("Transaction submission failed.")
             raise
 
-    # ---------------------------------------------------------
+    # --------------------------------------------------
     def run(self) -> None:
-        logger.info("Sending %.6f ETH from %s to %s",
-                    self.transfer_amount_eth,
-                    self.from_address,
-                    self.to_address)
+        logger.info(
+            "Sending %.6f ETH from %s to %s",
+            self.amount_eth,
+            self.from_address,
+            self.to_address,
+        )
 
         try:
-            tx_hash = self.send_eth()
+            tx_hash = self.send()
             logger.info("Transfer successful: %s", tx_hash)
         except Exception as exc:
             logger.critical("Execution failed: %s", exc)
             sys.exit(1)
 
 
+# ==================================================
 if __name__ == "__main__":
     EtherTransfer().run()
