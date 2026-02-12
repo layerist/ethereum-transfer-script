@@ -5,7 +5,8 @@ Robust ETH transfer utility using Web3.py.
 Features:
 - Strict environment validation
 - EIP-1559 first, legacy fallback
-- Safe gas headroom calculation
+- Deterministic fee bounds
+- Safe balance pre-check
 - Deterministic retry logic
 - Explicit error boundaries
 """
@@ -21,7 +22,7 @@ from typing import Any, Callable, Dict, Optional
 from dotenv import load_dotenv
 from web3 import Web3
 from web3.middleware import geth_poa_middleware
-from web3.exceptions import InsufficientFunds
+from web3.exceptions import InsufficientFunds, TransactionNotFound
 
 
 # ==================================================
@@ -39,18 +40,20 @@ logger = logging.getLogger("EtherTransfer")
 # ==================================================
 DEFAULT_AMOUNT_ETH = 0.01
 DEFAULT_GAS_LIMIT = 21_000
+
 DEFAULT_PRIORITY_FEE_GWEI = 2
-EIP1559_FEE_MULTIPLIER = 2  # baseFee * multiplier
+EIP1559_BASEFEE_MULTIPLIER = 2  # conservative maxFee bound
 
 RETRY_ATTEMPTS = 3
 RETRY_DELAY_SEC = 2
+
+RECEIPT_TIMEOUT_SEC = 120
 
 
 # ==================================================
 # Utilities
 # ==================================================
 def env_required(name: str) -> str:
-    """Read required environment variable or exit."""
     value = os.getenv(name)
     if not value:
         logger.critical("Missing required environment variable: %s", name)
@@ -59,7 +62,6 @@ def env_required(name: str) -> str:
 
 
 def parse_positive_float(value: Optional[str], default: float) -> float:
-    """Parse positive float or return default."""
     if not value:
         return default
     try:
@@ -75,7 +77,6 @@ def retry(
     *args: Any,
     **kwargs: Any,
 ) -> Any:
-    """Retry wrapper with logging."""
     for attempt in range(1, RETRY_ATTEMPTS + 1):
         try:
             return func(*args, **kwargs)
@@ -155,10 +156,16 @@ class EtherTransfer:
     # Gas handling
     # ==================================================
     def get_gas_params(self) -> Dict[str, int]:
-        """Return gas parameters (EIP-1559 preferred)."""
+        """
+        Returns gas parameters.
+        Prefers EIP-1559, falls back to legacy gasPrice.
+        """
 
         if self.custom_gas_price_wei:
-            logger.info("Using custom legacy gas price: %d wei", self.custom_gas_price_wei)
+            logger.info(
+                "Using custom legacy gas price: %d wei",
+                self.custom_gas_price_wei,
+            )
             return {"gasPrice": self.custom_gas_price_wei}
 
         try:
@@ -170,7 +177,7 @@ class EtherTransfer:
                     DEFAULT_PRIORITY_FEE_GWEI,
                     "gwei",
                 )
-                max_fee = base_fee * EIP1559_FEE_MULTIPLIER + priority_fee
+                max_fee = base_fee * EIP1559_BASEFEE_MULTIPLIER + priority_fee
 
                 return {
                     "maxFeePerGas": max_fee,
@@ -178,7 +185,7 @@ class EtherTransfer:
                 }
 
         except Exception as exc:
-            logger.debug("EIP-1559 gas calculation failed: %s", exc)
+            logger.debug("EIP-1559 fee calculation failed: %s", exc)
 
         gas_price = retry(self.web3.eth.gas_price, "Fetch legacy gas price")
         return {"gasPrice": gas_price}
@@ -227,9 +234,17 @@ class EtherTransfer:
 
     # --------------------------------------------------
     @staticmethod
-    def estimate_total_cost(tx: Dict[str, Any]) -> int:
+    def estimate_max_cost(tx: Dict[str, Any]) -> int:
+        """
+        Upper-bound cost estimation.
+        Uses maxFeePerGas when available.
+        """
         gas_limit = tx["gas"]
-        gas_price = tx.get("maxFeePerGas") or tx.get("gasPrice") or 0
+        gas_price = (
+            tx.get("maxFeePerGas")
+            or tx.get("gasPrice")
+            or 0
+        )
         return gas_limit * gas_price + tx["value"]
 
     # ==================================================
@@ -242,7 +257,7 @@ class EtherTransfer:
         tx = self.build_transaction(value_wei, gas_params)
 
         balance = self.web3.eth.get_balance(self.from_address)
-        required = self.estimate_total_cost(tx)
+        required = self.estimate_max_cost(tx)
 
         if balance < required:
             raise ValueError(
@@ -264,6 +279,24 @@ class EtherTransfer:
             raise
 
     # --------------------------------------------------
+    def wait_for_receipt(self, tx_hash: str) -> None:
+        logger.info("Waiting for confirmation...")
+        try:
+            receipt = self.web3.eth.wait_for_transaction_receipt(
+                tx_hash,
+                timeout=RECEIPT_TIMEOUT_SEC,
+            )
+            logger.info(
+                "Confirmed in block %d | status=%s",
+                receipt.blockNumber,
+                receipt.status,
+            )
+        except TransactionNotFound:
+            logger.warning("Transaction not found yet.")
+        except Exception as exc:
+            logger.warning("Receipt wait failed: %s", exc)
+
+    # --------------------------------------------------
     def run(self) -> None:
         logger.info(
             "Sending %.6f ETH from %s to %s",
@@ -274,7 +307,8 @@ class EtherTransfer:
 
         try:
             tx_hash = self.send()
-            logger.info("Transfer successful: %s", tx_hash)
+            self.wait_for_receipt(tx_hash)
+            logger.info("Transfer completed: %s", tx_hash)
         except Exception as exc:
             logger.critical("Execution failed: %s", exc)
             sys.exit(1)
