@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Ultra-Reliable Native Coin Sweeper v6 — Single Wallet Safe Edition
+Ultra-Reliable Native Coin Sweeper v7 — Single Wallet Safe Edition
 
 Sweeps the native coin of one EVM wallet to one fixed destination.
 
@@ -10,7 +10,10 @@ Safety properties:
 - single-process lock prevents concurrent use of the same state file;
 - atomic, fsync-backed state writes;
 - persistent replacement history and receipt checks for every known tx hash;
+- replacement-fee headroom is reserved before the initial sweep;
+- mined-but-not-final transactions are never replaced while awaiting confirmations;
 - replacement transactions preserve nonce, destination, value, gas and chain;
+- persisted raw transactions are hash-checked and signer-verified before recovery;
 - conservative nonce reconciliation across several RPC endpoints;
 - wrong-chain RPC endpoints are permanently disabled;
 - EIP-1559 and legacy fee support;
@@ -85,7 +88,8 @@ if hasattr(signal, "SIGTERM"):
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 WEI_PER_ETH = Decimal("1000000000000000000")
 WEI_PER_GWEI = Decimal("1000000000")
-STATE_SCHEMA = "native-sweeper-v6"
+STATE_SCHEMA = "native-sweeper-v7"
+SUPPORTED_STATE_SCHEMAS = {"native-sweeper-v6", STATE_SCHEMA}
 
 
 class SweeperError(RuntimeError):
@@ -259,6 +263,7 @@ class Config:
     priority_fee_gwei: Decimal
     max_fee_multiplier: Decimal
     fee_bump_pct: Decimal
+    replacement_headroom_bumps: int
     max_fee_gwei: Decimal
     max_priority_fee_gwei: Decimal
 
@@ -320,6 +325,14 @@ class Config:
         if proxy_url and urlsplit(proxy_url).scheme not in {"http", "https", "socks5", "socks5h"}:
             raise ConfigError("RPC_PROXY_URL must use http, https, socks5 or socks5h")
 
+        max_replacements = parse_int_env("MAX_REPLACEMENTS", 3, minimum=0, maximum=100)
+        replacement_headroom_bumps = parse_int_env(
+            "REPLACEMENT_HEADROOM_BUMPS",
+            max_replacements,
+            minimum=0,
+            maximum=100,
+        )
+
         return cls(
             rpc_urls=rpc_urls,
             private_key=private_key,
@@ -343,11 +356,12 @@ class Config:
             priority_fee_gwei=parse_decimal_env("PRIORITY_FEE_GWEI", "2", minimum="0"),
             max_fee_multiplier=parse_decimal_env("MAX_FEE_MULTIPLIER", "2", minimum="1", maximum="10"),
             fee_bump_pct=parse_decimal_env("FEE_BUMP_PCT", "15", minimum="10", maximum="200"),
+            replacement_headroom_bumps=replacement_headroom_bumps,
             max_fee_gwei=parse_decimal_env("MAX_FEE_GWEI", "500", minimum="0.000000001"),
             max_priority_fee_gwei=parse_decimal_env(
                 "MAX_PRIORITY_FEE_GWEI", "100", minimum="0"
             ),
-            max_replacements=parse_int_env("MAX_REPLACEMENTS", 3, minimum=0, maximum=100),
+            max_replacements=max_replacements,
             max_sweep_rounds=parse_int_env("MAX_SWEEP_ROUNDS", 1, minimum=1, maximum=100),
             min_confirmations=parse_int_env("MIN_CONFIRMATIONS", 1, minimum=1, maximum=10_000),
             allow_unknown_pending=parse_bool(os.getenv("ALLOW_UNKNOWN_PENDING"), False),
@@ -682,7 +696,7 @@ class RPCManager:
 
     def find_any_receipt(self, tx_hashes: Iterable[str]) -> Optional[tuple[str, Any]]:
         hashes = list(dict.fromkeys(tx_hashes))
-        for node in self.ranked_nodes():
+        for node in self.ranked_nodes(include_cooling=True):
             for tx_hash in reversed(hashes):
                 try:
                     receipt = node.w3.eth.get_transaction_receipt(tx_hash)
@@ -740,6 +754,13 @@ class Sweeper:
             raise ConfigError("TO_ADDRESS cannot be the zero address")
         if self.cfg.max_priority_fee_gwei > self.cfg.max_fee_gwei:
             raise ConfigError("MAX_PRIORITY_FEE_GWEI cannot exceed MAX_FEE_GWEI")
+        if self.cfg.replacement_headroom_bumps < self.cfg.max_replacements:
+            log.warning(
+                "REPLACEMENT_HEADROOM_BUMPS=%s is below MAX_REPLACEMENTS=%s; later "
+                "same-value replacements may become unaffordable without RESERVE_WEI",
+                self.cfg.replacement_headroom_bumps,
+                self.cfg.max_replacements,
+            )
 
     def _validate_destination(self) -> None:
         code = bytes(
@@ -786,8 +807,8 @@ class Sweeper:
             if bump and previous_fee:
                 old_priority = int(previous_fee["maxPriorityFeePerGas"])
                 old_max_fee = int(previous_fee["maxFeePerGas"])
-                priority = max(priority, int(Decimal(old_priority) * bump_factor))
-                max_fee = max(max_fee, int(Decimal(old_max_fee) * bump_factor))
+                priority = max(priority, self._ceil_decimal(Decimal(old_priority) * bump_factor))
+                max_fee = max(max_fee, self._ceil_decimal(Decimal(old_max_fee) * bump_factor))
 
             max_priority_cap = gwei_to_wei(self.cfg.max_priority_fee_gwei)
             max_fee_cap = gwei_to_wei(self.cfg.max_fee_gwei)
@@ -812,7 +833,7 @@ class Sweeper:
         if bump and previous_fee:
             gas_price = max(
                 gas_price,
-                int(Decimal(int(previous_fee["gasPrice"])) * bump_factor),
+                self._ceil_decimal(Decimal(int(previous_fee["gasPrice"])) * bump_factor),
             )
         cap = gwei_to_wei(self.cfg.max_fee_gwei)
         if gas_price > cap:
@@ -824,6 +845,28 @@ class Sweeper:
     @staticmethod
     def _fee_ceiling(fee: dict[str, int]) -> int:
         return int(fee.get("maxFeePerGas", fee.get("gasPrice", 0)))
+
+    @staticmethod
+    def _ceil_decimal(value: Decimal) -> int:
+        return int(value.to_integral_value(rounding=ROUND_CEILING))
+
+    def _replacement_budget_per_gas(self, fee: dict[str, int]) -> int:
+        """Reserve enough value for configured future fee bumps.
+
+        This prevents the first sweep from consuming so much balance that a
+        same-value replacement becomes unaffordable immediately afterwards.
+        It intentionally models fee bumps from the current quote; a sudden
+        base-fee jump can still exceed this budget and is then stopped by the
+        configured hard fee caps.
+        """
+        current = self._fee_ceiling(fee)
+        if self.cfg.replacement_headroom_bumps <= 0:
+            return current
+
+        bump_factor = Decimal("1") + self.cfg.fee_bump_pct / Decimal("100")
+        budget = Decimal(current) * (bump_factor ** self.cfg.replacement_headroom_bumps)
+        cap = gwei_to_wei(self.cfg.max_fee_gwei)
+        return min(cap, self._ceil_decimal(budget))
 
     def _determine_gas_limit(self, fee: dict[str, int], balance: int) -> int:
         if not self.cfg.auto_estimate_gas:
@@ -863,12 +906,14 @@ class Sweeper:
         fee = self._fee_data()
         balance = self._current_balance()
         gas_limit = self._determine_gas_limit(fee, balance)
-        max_cost = gas_limit * self._fee_ceiling(fee)
-        value = balance - max_cost - self.cfg.reserve_wei
+        quoted_fee_cost = gas_limit * self._fee_ceiling(fee)
+        replacement_budget = gas_limit * self._replacement_budget_per_gas(fee)
+        value = balance - replacement_budget - self.cfg.reserve_wei
         if value < self.cfg.min_sweep_wei:
             raise NoSweepableBalance(
                 "No sweepable balance: "
-                f"balance={wei_to_coin(balance)}, max_gas_cost={wei_to_coin(max_cost)}, "
+                f"balance={wei_to_coin(balance)}, quoted_gas_cost={wei_to_coin(quoted_fee_cost)}, "
+                f"replacement_budget={wei_to_coin(replacement_budget)}, "
                 f"reserve={wei_to_coin(self.cfg.reserve_wei)}, "
                 f"minimum={wei_to_coin(self.cfg.min_sweep_wei)}"
             )
@@ -956,8 +1001,14 @@ class Sweeper:
         missing = required - state.keys()
         if missing:
             raise StateError(f"State file is missing fields: {sorted(missing)}")
-        if state["schema"] != STATE_SCHEMA or state["status"] != "pending":
+        if state["schema"] not in SUPPORTED_STATE_SCHEMAS or state["status"] != "pending":
             raise StateError("State file schema/status is unsupported")
+        if state["schema"] != STATE_SCHEMA:
+            log.warning(
+                "Recovering compatible legacy state schema=%s; it will be upgraded on the next save",
+                state["schema"],
+            )
+            state["schema"] = STATE_SCHEMA
         if str(state["from"]).lower() != self.from_addr.lower():
             raise StateError("State FROM address does not match configuration")
         if str(state["to"]).lower() != self.to_addr.lower():
@@ -971,6 +1022,29 @@ class Sweeper:
                 raise StateError(f"Current state entry is missing {key}")
         if int(state["nonce"]) < 0 or int(state["gas"]) < 21_000 or int(state["value"]) < 0:
             raise StateError("State contains invalid numeric transaction fields")
+
+        entries = [*state["history"], state["current"]]
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise StateError("State transaction history contains a non-object entry")
+            for key in ("tx_hash", "raw_transaction", "fee"):
+                if key not in entry:
+                    raise StateError(f"State transaction entry is missing {key}")
+            raw = decode_raw_transaction(str(entry["raw_transaction"]))
+            calculated_hash = Web3.to_hex(Web3.keccak(raw))
+            if calculated_hash.lower() != str(entry["tx_hash"]).lower():
+                raise StateError(
+                    f"State raw transaction hash mismatch: stored={entry['tx_hash']} "
+                    f"calculated={calculated_hash}"
+                )
+            try:
+                recovered = Account.recover_transaction(raw)
+            except Exception as exc:
+                raise StateError("Cannot recover signer from state raw transaction") from exc
+            if recovered.lower() != self.from_addr.lower():
+                raise StateError(
+                    f"State raw transaction signer {recovered} does not match {self.from_addr}"
+                )
 
     @staticmethod
     def _all_hashes(state: dict[str, Any]) -> list[str]:
@@ -992,7 +1066,7 @@ class Sweeper:
             fee_text,
         )
 
-    def _receipt_with_confirmations(self, state: dict[str, Any]) -> Optional[tuple[str, Any]]:
+    def _receipt_info(self, state: dict[str, Any]) -> Optional[tuple[str, Any, int]]:
         found = self.rpc.find_any_receipt(self._all_hashes(state))
         if found is None:
             return None
@@ -1001,12 +1075,19 @@ class Sweeper:
         if block_number is None:
             return None
         latest_block = int(self.rpc.call("latest block number", lambda w3: w3.eth.block_number))
-        confirmations = latest_block - int(block_number) + 1
+        confirmations = max(0, latest_block - int(block_number) + 1)
+        return tx_hash, receipt, confirmations
+
+    def _confirmed_receipt(self, state: dict[str, Any]) -> Optional[tuple[str, Any]]:
+        info = self._receipt_info(state)
+        if info is None:
+            return None
+        tx_hash, receipt, confirmations = info
         if confirmations < self.cfg.min_confirmations:
             log.info(
                 "Mined but awaiting confirmations: tx=%s block=%s confirmations=%s/%s",
                 tx_hash,
-                block_number,
+                receipt.get("blockNumber"),
                 confirmations,
                 self.cfg.min_confirmations,
             )
@@ -1044,13 +1125,39 @@ class Sweeper:
         return result
 
     def _reconcile_nonce_consumed(self, state: dict[str, Any]) -> Optional[bool]:
-        receipt = self._receipt_with_confirmations(state)
-        if receipt is not None:
-            return self._handle_receipt(receipt[0], receipt[1], state)
+        info = self._receipt_info(state)
+        if info is not None:
+            tx_hash, receipt, confirmations = info
+            if confirmations >= self.cfg.min_confirmations:
+                return self._handle_receipt(tx_hash, receipt, state)
+            log.info(
+                "Known transaction is mined but not final enough yet: tx=%s "
+                "confirmations=%s/%s; preserving state and never replacing it",
+                tx_hash,
+                confirmations,
+                self.cfg.min_confirmations,
+            )
+            return None
 
         latest, pending = self.rpc.nonce_counts(self.from_addr)
         nonce = int(state["nonce"])
         if latest > nonce:
+            # Retry receipts once after observing the confirmed nonce. Different
+            # RPCs can expose nonce advancement slightly before another endpoint
+            # exposes the receipt.
+            time.sleep(min(1.0, float(self.cfg.receipt_poll_sec)))
+            info = self._receipt_info(state)
+            if info is not None:
+                tx_hash, receipt, confirmations = info
+                if confirmations >= self.cfg.min_confirmations:
+                    return self._handle_receipt(tx_hash, receipt, state)
+                log.info(
+                    "Receipt appeared during nonce reconciliation: tx=%s confirmations=%s/%s",
+                    tx_hash,
+                    confirmations,
+                    self.cfg.min_confirmations,
+                )
+                return None
             raise StateError(
                 f"Nonce {nonce} is confirmed as consumed, but no receipt for any known hash was "
                 "found. A conflicting transaction may have replaced this sweeper transaction. "
@@ -1066,7 +1173,7 @@ class Sweeper:
     def _wait_for_receipt(self, state: dict[str, Any], timeout: int) -> Optional[tuple[str, Any]]:
         deadline = time.monotonic() + timeout
         while not SHUTDOWN and time.monotonic() < deadline:
-            receipt = self._receipt_with_confirmations(state)
+            receipt = self._confirmed_receipt(state)
             if receipt is not None:
                 return receipt
             time.sleep(self.cfg.receipt_poll_sec + random.uniform(0.0, 1.0))
@@ -1114,9 +1221,22 @@ class Sweeper:
             return False
 
         while not SHUTDOWN:
-            receipt = self._receipt_with_confirmations(state)
-            if receipt is not None:
-                return self._handle_receipt(receipt[0], receipt[1], state)
+            info = self._receipt_info(state)
+            if info is not None:
+                tx_hash, receipt, confirmations = info
+                if confirmations >= self.cfg.min_confirmations:
+                    return self._handle_receipt(tx_hash, receipt, state)
+
+                # Once any known replacement is mined, never broadcast or replace
+                # another transaction with this nonce while finality is pending.
+                log.info(
+                    "Mined tx awaiting confirmations: tx=%s confirmations=%s/%s",
+                    tx_hash,
+                    confirmations,
+                    self.cfg.min_confirmations,
+                )
+                time.sleep(self.cfg.receipt_poll_sec + random.uniform(0.0, 1.0))
+                continue
 
             self._reconcile_nonce_consumed(state)
             current = state["current"]
@@ -1130,6 +1250,20 @@ class Sweeper:
             receipt = self._wait_for_receipt(state, self.cfg.receipt_timeout_sec)
             if receipt is not None:
                 return self._handle_receipt(receipt[0], receipt[1], state)
+
+            # A tx may have become mined during the wait without yet reaching
+            # MIN_CONFIRMATIONS. In that case replacement would be unsafe.
+            info = self._receipt_info(state)
+            if info is not None:
+                tx_hash, _, confirmations = info
+                log.info(
+                    "Not replacing mined tx=%s while confirmations=%s/%s",
+                    tx_hash,
+                    confirmations,
+                    self.cfg.min_confirmations,
+                )
+                continue
+
             state = self._replace(state)
 
         log.warning("Stopped with recoverable state preserved at %s", self.cfg.state_file)
