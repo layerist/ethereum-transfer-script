@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Ultra-Reliable Native Coin Sweeper v7 — Single Wallet Safe Edition
+Ultra-Reliable Native Coin Sweeper v8 — Single Wallet Safe Edition
 
 Sweeps the native coin of one EVM wallet to one fixed destination.
 
 Safety properties:
 - dry-run by default;
-- explicit chain-id validation is strongly recommended;
-- single-process lock prevents concurrent use of the same state file;
+- explicit chain-id is mandatory for live transfers;
+- ownership-aware process lock prevents concurrent use and recovers dead local locks;
 - atomic, fsync-backed state writes;
 - persistent replacement history and receipt checks for every known tx hash;
 - replacement-fee headroom is reserved before the initial sweep;
@@ -15,7 +15,7 @@ Safety properties:
 - replacement transactions preserve nonce, destination, value, gas and chain;
 - persisted raw transactions are hash-checked and signer-verified before recovery;
 - conservative nonce reconciliation across several RPC endpoints;
-- wrong-chain RPC endpoints are permanently disabled;
+- wrong-chain or hash-corrupt RPC endpoints are permanently disabled;
 - EIP-1559 and legacy fee support;
 - fee caps prevent accidental transactions during extreme fee spikes;
 - optional proxy with fail-closed configuration;
@@ -35,6 +35,7 @@ import random
 import signal
 import socket
 import time
+import uuid
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from pathlib import Path
@@ -88,8 +89,8 @@ if hasattr(signal, "SIGTERM"):
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 WEI_PER_ETH = Decimal("1000000000000000000")
 WEI_PER_GWEI = Decimal("1000000000")
-STATE_SCHEMA = "native-sweeper-v7"
-SUPPORTED_STATE_SCHEMAS = {"native-sweeper-v6", STATE_SCHEMA}
+STATE_SCHEMA = "native-sweeper-v8"
+SUPPORTED_STATE_SCHEMAS = {"native-sweeper-v6", "native-sweeper-v7", STATE_SCHEMA}
 
 
 class SweeperError(RuntimeError):
@@ -231,6 +232,33 @@ def is_replacement_underpriced_error(exc: BaseException) -> bool:
 
 def ensure_parent_directory(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def interruptible_sleep(seconds: float, *, quantum: float = 0.5) -> None:
+    """Sleep while remaining responsive to SIGINT/SIGTERM."""
+    deadline = time.monotonic() + max(0.0, seconds)
+    while not SHUTDOWN:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(quantum, remaining))
+
+
+def process_is_alive(pid: int) -> Optional[bool]:
+    """Best-effort local PID probe. None means the platform cannot decide safely."""
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return None
+    return True
 
 
 # =============================================================================
@@ -378,37 +406,73 @@ class Config:
 # =============================================================================
 
 class ProcessLock:
-    """Simple cross-platform best-effort lock based on atomic file creation."""
+    """Cross-platform lock file with conservative stale-lock recovery."""
 
     def __init__(self, path: Path):
         self.path = path
         self.acquired = False
+        self.token = uuid.uuid4().hex
 
-    def acquire(self) -> None:
-        ensure_parent_directory(self.path)
-        payload = {
+    def _payload(self) -> dict[str, Any]:
+        return {
             "pid": os.getpid(),
             "hostname": socket.gethostname(),
             "created_at": time.time(),
+            "token": self.token,
         }
-        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+
+    def _read_existing(self) -> Optional[dict[str, Any]]:
         try:
-            fd = os.open(self.path, flags, 0o600)
-        except FileExistsError as exc:
-            details = ""
+            value = json.loads(self.path.read_text(encoding="utf-8"))
+            return value if isinstance(value, dict) else None
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def _remove_stale_local_lock(self) -> bool:
+        existing = self._read_existing()
+        if not existing:
+            return False
+        if str(existing.get("hostname", "")) != socket.gethostname():
+            return False
+        try:
+            pid = int(existing.get("pid", -1))
+        except (TypeError, ValueError):
+            return False
+        alive = process_is_alive(pid)
+        if alive is not False:
+            return False
+        try:
+            self.path.unlink()
+            log.warning("Removed stale local lock from dead pid=%s: %s", pid, self.path)
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+
+    def acquire(self) -> None:
+        ensure_parent_directory(self.path)
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+
+        for attempt in range(2):
             try:
-                details = self.path.read_text(encoding="utf-8").strip()
-            except OSError:
-                pass
-            raise StateError(
-                f"Another sweeper instance may be running; lock exists: {self.path}. "
-                f"Lock contents: {details or '<unreadable>'}. Remove it only after "
-                "confirming that no sweeper process is active."
-            ) from exc
+                fd = os.open(self.path, flags, 0o600)
+                break
+            except FileExistsError as exc:
+                if attempt == 0 and self._remove_stale_local_lock():
+                    continue
+                existing = self._read_existing()
+                raise StateError(
+                    f"Another sweeper instance may be running; lock exists: {self.path}. "
+                    f"Lock contents: {existing or '<unreadable>'}. Remove it only after "
+                    "confirming that no sweeper process is active."
+                ) from exc
+        else:
+            raise StateError(f"Unable to acquire lock: {self.path}")
 
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle, sort_keys=True)
+                json.dump(self._payload(), handle, sort_keys=True)
                 handle.flush()
                 os.fsync(handle.fileno())
         except Exception:
@@ -421,11 +485,17 @@ class ProcessLock:
         atexit.register(self.release)
 
     def release(self) -> None:
-        if self.acquired:
-            try:
+        if not self.acquired:
+            return
+        try:
+            existing = self._read_existing()
+            if existing and existing.get("token") == self.token:
                 self.path.unlink(missing_ok=True)
-            except OSError as exc:
-                log.error("Unable to remove lock file %s: %s", self.path, exc)
+            elif self.path.exists():
+                log.error("Refusing to remove lock file not owned by this process: %s", self.path)
+        except OSError as exc:
+            log.error("Unable to remove lock file %s: %s", self.path, exc)
+        finally:
             self.acquired = False
 
     def __enter__(self) -> "ProcessLock":
@@ -663,15 +733,19 @@ class RPCManager:
             try:
                 returned_hash = Web3.to_hex(node.w3.eth.send_raw_transaction(raw_tx))
                 self._success(node)
-                result.accepted = True
                 if returned_hash.lower() != tx_hash.lower():
-                    log.warning(
-                        "RPC returned a different hash: expected=%s got=%s url=%s",
+                    node.disabled = True
+                    result.errors.append(
+                        f"{redact_url(node.url)}: returned mismatched transaction hash"
+                    )
+                    log.error(
+                        "Disabled RPC that returned a different hash: expected=%s got=%s url=%s",
                         tx_hash,
                         returned_hash,
                         redact_url(node.url),
                     )
                 else:
+                    result.accepted = True
                     log.info("Broadcast accepted by %s", redact_url(node.url))
             except Exception as exc:
                 if is_already_known_error(exc):
@@ -742,6 +816,11 @@ class Sweeper:
         )
 
     def _validate_static_config(self) -> None:
+        if not self.cfg.dry_run and self.cfg.expected_chain_id is None:
+            raise ConfigError(
+                "EXPECTED_CHAIN_ID is required when DRY_RUN=false. "
+                "Refusing to infer the destination chain for a live transfer."
+            )
         if self.account.address.lower() != self.from_addr.lower():
             raise ConfigError(
                 f"PRIVATE_KEY belongs to {self.account.address}, not FROM_ADDRESS={self.from_addr}"
@@ -763,19 +842,22 @@ class Sweeper:
             )
 
     def _validate_destination(self) -> None:
-        code = bytes(
-            self.rpc.call(
-                "destination bytecode",
-                lambda w3: w3.eth.get_code(self.to_addr, "latest"),
-            )
+        results = self.rpc.collect(
+            "destination bytecode",
+            lambda w3: bytes(w3.eth.get_code(self.to_addr, "latest")),
         )
-        if code and not self.cfg.allow_contract_destination:
+        lengths = [len(code) for _, code in results]
+        has_code = any(length > 0 for length in lengths)
+        if len(set(lengths)) > 1:
+            log.warning("RPC destination-code disagreement: bytecode_lengths=%s", lengths)
+        if has_code and not self.cfg.allow_contract_destination:
             raise ConfigError(
-                "TO_ADDRESS contains contract bytecode. Native transfers to contracts may "
-                "execute code or revert. Set ALLOW_CONTRACT_DESTINATION=true only after review."
+                "TO_ADDRESS contains contract bytecode according to at least one RPC. "
+                "Native transfers to contracts may execute code or revert. Set "
+                "ALLOW_CONTRACT_DESTINATION=true only after review."
             )
-        if code:
-            log.warning("Destination is a contract (%s bytecode bytes)", len(code))
+        if has_code:
+            log.warning("Destination is a contract (RPC bytecode lengths=%s)", lengths)
 
     def _current_balance(self) -> int:
         values = self.rpc.collect(
@@ -1017,6 +1099,11 @@ class Sweeper:
             raise StateError("State chain_id does not match configuration")
         if not isinstance(state["history"], list) or not isinstance(state["current"], dict):
             raise StateError("State history/current has an invalid type")
+        replacement_count = int(state["replacement_count"])
+        if replacement_count < 0 or replacement_count != len(state["history"]):
+            raise StateError(
+                "State replacement_count does not match replacement history length"
+            )
         for key in ("tx_hash", "raw_transaction", "fee"):
             if key not in state["current"]:
                 raise StateError(f"Current state entry is missing {key}")
@@ -1145,7 +1232,7 @@ class Sweeper:
             # Retry receipts once after observing the confirmed nonce. Different
             # RPCs can expose nonce advancement slightly before another endpoint
             # exposes the receipt.
-            time.sleep(min(1.0, float(self.cfg.receipt_poll_sec)))
+            interruptible_sleep(min(1.0, float(self.cfg.receipt_poll_sec)))
             info = self._receipt_info(state)
             if info is not None:
                 tx_hash, receipt, confirmations = info
@@ -1176,7 +1263,7 @@ class Sweeper:
             receipt = self._confirmed_receipt(state)
             if receipt is not None:
                 return receipt
-            time.sleep(self.cfg.receipt_poll_sec + random.uniform(0.0, 1.0))
+            interruptible_sleep(self.cfg.receipt_poll_sec + random.uniform(0.0, 1.0))
         return None
 
     def _replace(self, state: dict[str, Any]) -> dict[str, Any]:
@@ -1235,7 +1322,7 @@ class Sweeper:
                     confirmations,
                     self.cfg.min_confirmations,
                 )
-                time.sleep(self.cfg.receipt_poll_sec + random.uniform(0.0, 1.0))
+                interruptible_sleep(self.cfg.receipt_poll_sec + random.uniform(0.0, 1.0))
                 continue
 
             self._reconcile_nonce_consumed(state)
