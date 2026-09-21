@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Ultra-Reliable Native Coin Sweeper v8 — Single Wallet Safe Edition
+Ultra-Reliable Native Coin Sweeper v9 — Single Wallet Safe Edition
 
 Sweeps the native coin of one EVM wallet to one fixed destination.
 
@@ -89,8 +89,8 @@ if hasattr(signal, "SIGTERM"):
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 WEI_PER_ETH = Decimal("1000000000000000000")
 WEI_PER_GWEI = Decimal("1000000000")
-STATE_SCHEMA = "native-sweeper-v8"
-SUPPORTED_STATE_SCHEMAS = {"native-sweeper-v6", "native-sweeper-v7", STATE_SCHEMA}
+STATE_SCHEMA = "native-sweeper-v9"
+SUPPORTED_STATE_SCHEMAS = {"native-sweeper-v6", "native-sweeper-v7", "native-sweeper-v8", STATE_SCHEMA}
 
 
 class SweeperError(RuntimeError):
@@ -201,6 +201,17 @@ def decode_raw_transaction(raw_hex: str) -> bytes:
         return bytes.fromhex(value)
     except ValueError as exc:
         raise StateError("State contains an invalid raw_transaction hex string") from exc
+
+
+def normalize_tx_hash(value: Any) -> str:
+    text = str(value).strip()
+    if not text.startswith("0x") or len(text) != 66:
+        raise StateError(f"Invalid transaction hash in state: {text!r}")
+    try:
+        bytes.fromhex(text[2:])
+    except ValueError as exc:
+        raise StateError(f"Invalid transaction hash in state: {text!r}") from exc
+    return text.lower()
 
 
 def exception_text(exc: BaseException) -> str:
@@ -481,6 +492,7 @@ class ProcessLock:
             finally:
                 raise
 
+        StateStore._fsync_directory(self.path.parent)
         self.acquired = True
         atexit.register(self.release)
 
@@ -491,6 +503,7 @@ class ProcessLock:
             existing = self._read_existing()
             if existing and existing.get("token") == self.token:
                 self.path.unlink(missing_ok=True)
+                StateStore._fsync_directory(self.path.parent)
             elif self.path.exists():
                 log.error("Refusing to remove lock file not owned by this process: %s", self.path)
         except OSError as exc:
@@ -535,6 +548,10 @@ class StateStore:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary, self.path)
+            try:
+                os.chmod(self.path, 0o600)
+            except OSError:
+                pass
             self._fsync_directory(self.path.parent)
         except OSError as exc:
             temporary.unlink(missing_ok=True)
@@ -877,16 +894,39 @@ class Sweeper:
         previous_fee: Optional[dict[str, int]] = None,
         bump: bool = False,
     ) -> dict[str, int]:
-        block = self.rpc.call("latest block", lambda w3: w3.eth.get_block("latest"))
-        bump_factor = Decimal("1") + self.cfg.fee_bump_pct / Decimal("100")
-        base_fee = block.get("baseFeePerGas")
+        """Return a conservative fee quote across all reachable RPCs.
 
-        if base_fee is not None:
+        For EIP-1559 chains the highest observed base fee is used. For legacy
+        chains the highest observed gas price is used. This deliberately favors
+        reliable inclusion over a single endpoint's potentially stale quote.
+        """
+        block_results = self.rpc.collect(
+            "latest block fee data", lambda w3: w3.eth.get_block("latest")
+        )
+        base_fees = [
+            int(block.get("baseFeePerGas"))
+            for _, block in block_results
+            if block.get("baseFeePerGas") is not None
+        ]
+        bump_factor = Decimal("1") + self.cfg.fee_bump_pct / Decimal("100")
+
+        if base_fees:
+            if len(base_fees) != len(block_results):
+                log.warning(
+                    "RPCs disagree on EIP-1559 support; using EIP-1559 because at least one "
+                    "reachable endpoint reports baseFeePerGas"
+                )
+            base_fee = max(base_fees)
+            if len(set(base_fees)) > 1:
+                log.warning("RPC base-fee disagreement: %s; using maximum=%s", base_fees, base_fee)
+
             priority = gwei_to_wei(self.cfg.priority_fee_gwei)
-            max_fee = int(
-                Decimal(int(base_fee)) * self.cfg.max_fee_multiplier + Decimal(priority)
+            max_fee = self._ceil_decimal(
+                Decimal(base_fee) * self.cfg.max_fee_multiplier + Decimal(priority)
             )
             if bump and previous_fee:
+                if "maxPriorityFeePerGas" not in previous_fee or "maxFeePerGas" not in previous_fee:
+                    raise StateError("Cannot build EIP-1559 replacement from incompatible saved fee data")
                 old_priority = int(previous_fee["maxPriorityFeePerGas"])
                 old_max_fee = int(previous_fee["maxFeePerGas"])
                 priority = max(priority, self._ceil_decimal(Decimal(old_priority) * bump_factor))
@@ -903,16 +943,23 @@ class Sweeper:
                 raise ConfigError(
                     f"Required max fee {max_fee} wei exceeds MAX_FEE_GWEI={self.cfg.max_fee_gwei}"
                 )
-            if max_fee < priority:
-                max_fee = priority
+            max_fee = max(max_fee, priority)
             return {
                 "type": 2,
                 "maxPriorityFeePerGas": priority,
                 "maxFeePerGas": max_fee,
             }
 
-        gas_price = int(self.rpc.call("legacy gas price", lambda w3: w3.eth.gas_price))
+        gas_price_results = self.rpc.collect(
+            "legacy gas price", lambda w3: int(w3.eth.gas_price)
+        )
+        gas_prices = [value for _, value in gas_price_results]
+        gas_price = max(gas_prices)
+        if len(set(gas_prices)) > 1:
+            log.warning("RPC gas-price disagreement: %s; using maximum=%s", gas_prices, gas_price)
         if bump and previous_fee:
+            if "gasPrice" not in previous_fee:
+                raise StateError("Cannot build legacy replacement from incompatible saved fee data")
             gas_price = max(
                 gas_price,
                 self._ceil_decimal(Decimal(int(previous_fee["gasPrice"])) * bump_factor),
@@ -965,12 +1012,14 @@ class Sweeper:
             "value": provisional_value,
             **fee,
         }
-        estimate = int(
-            self.rpc.call(
-                "gas estimate",
-                lambda w3: w3.eth.estimate_gas(estimate_tx, "latest"),
-            )
+        estimate_results = self.rpc.collect(
+            "gas estimate",
+            lambda w3: int(w3.eth.estimate_gas(estimate_tx, "latest")),
         )
+        estimates = [value for _, value in estimate_results]
+        estimate = max(estimates)
+        if len(set(estimates)) > 1:
+            log.warning("RPC gas-estimate disagreement: %s; using maximum=%s", estimates, estimate)
         padded = int(
             (Decimal(estimate) * self.cfg.gas_estimate_multiplier).to_integral_value(
                 rounding=ROUND_CEILING
@@ -1117,9 +1166,22 @@ class Sweeper:
             for key in ("tx_hash", "raw_transaction", "fee"):
                 if key not in entry:
                     raise StateError(f"State transaction entry is missing {key}")
+            if not isinstance(entry["fee"], dict):
+                raise StateError("State transaction fee must be an object")
+            fee_keys = set(entry["fee"])
+            if fee_keys not in ({"gasPrice"}, {"maxFeePerGas", "maxPriorityFeePerGas"}):
+                raise StateError(f"State transaction contains unsupported fee fields: {sorted(fee_keys)}")
+            for fee_key, fee_value in entry["fee"].items():
+                try:
+                    parsed_fee = int(fee_value)
+                except (TypeError, ValueError) as exc:
+                    raise StateError(f"State fee {fee_key} is not an integer") from exc
+                if parsed_fee < 0:
+                    raise StateError(f"State fee {fee_key} cannot be negative")
+            stored_hash = normalize_tx_hash(entry["tx_hash"])
             raw = decode_raw_transaction(str(entry["raw_transaction"]))
-            calculated_hash = Web3.to_hex(Web3.keccak(raw))
-            if calculated_hash.lower() != str(entry["tx_hash"]).lower():
+            calculated_hash = Web3.to_hex(Web3.keccak(raw)).lower()
+            if calculated_hash != stored_hash:
                 raise StateError(
                     f"State raw transaction hash mismatch: stored={entry['tx_hash']} "
                     f"calculated={calculated_hash}"
@@ -1267,6 +1329,18 @@ class Sweeper:
         return None
 
     def _replace(self, state: dict[str, Any]) -> dict[str, Any]:
+        # Close the race between the final receipt poll and signing a replacement.
+        self._reconcile_nonce_consumed(state)
+        info = self._receipt_info(state)
+        if info is not None:
+            tx_hash, receipt, confirmations = info
+            if confirmations >= self.cfg.min_confirmations:
+                self._handle_receipt(tx_hash, receipt, state)
+            raise SweeperError(
+                f"Known transaction {tx_hash} became mined while preparing a replacement; "
+                "replacement aborted and state preserved"
+            )
+
         count = int(state["replacement_count"])
         if count >= self.cfg.max_replacements:
             raise TimeoutError(
