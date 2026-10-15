@@ -13,7 +13,7 @@ Safety properties:
 - replacement-fee headroom is reserved before the initial sweep;
 - mined-but-not-final transactions are never replaced while awaiting confirmations;
 - replacement transactions preserve nonce, destination, value, gas and chain;
-- persisted raw transactions are hash-checked and signer-verified before recovery;
+- persisted raw transactions are re-signed to verify their complete contents before recovery;
 - conservative nonce reconciliation across several RPC endpoints;
 - wrong-chain or hash-corrupt RPC endpoints are permanently disabled;
 - EIP-1559 and legacy fee support;
@@ -188,7 +188,7 @@ def redact_url(url: str) -> str:
             host = f"***:***@{host}"
         # Query strings often contain API keys.
         query = "<redacted>" if parts.query else ""
-        return urlunsplit((parts.scheme, host, parts.path, query, ""))
+        return urlunsplit((parts.scheme, host, "/<redacted>" if parts.path else "", query, ""))
     except Exception:
         return "<redacted-rpc-url>"
 
@@ -553,8 +553,11 @@ class StateStore:
             except OSError:
                 pass
             self._fsync_directory(self.path.parent)
-        except OSError as exc:
-            temporary.unlink(missing_ok=True)
+        except (OSError, TypeError, ValueError) as exc:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
             raise StateError(f"Unable to save state file {self.path}: {exc}") from exc
 
     def clear(self) -> None:
@@ -701,6 +704,14 @@ class RPCManager:
         else:
             chain_id = expected_chain_id
 
+        # Unreachable endpoints have not demonstrated that they are on the
+        # intended chain. Never allow them to broadcast transactions later.
+        verified_nodes = {id(node) for node, _ in results}
+        for node in self.nodes:
+            if id(node) not in verified_nodes:
+                node.disabled = True
+                log.error("Disabled unverified RPC: %s", redact_url(node.url))
+
         matching = 0
         for node, node_chain_id in results:
             if node_chain_id != chain_id:
@@ -785,14 +796,26 @@ class RPCManager:
             raise SweeperError(f"Broadcast failed for {tx_hash}: {result.errors}")
         return result
 
-    def find_any_receipt(self, tx_hashes: Iterable[str]) -> Optional[tuple[str, Any]]:
+    def find_any_receipt(self, tx_hashes: Iterable[str]) -> Optional[tuple[str, Any, int]]:
+        """Verify receipt canonicality and confirmations against the SAME RPC."""
         hashes = list(dict.fromkeys(tx_hashes))
         for node in self.ranked_nodes(include_cooling=True):
             for tx_hash in reversed(hashes):
                 try:
                     receipt = node.w3.eth.get_transaction_receipt(tx_hash)
+                    number = receipt.get("blockNumber")
+                    receipt_hash = receipt.get("blockHash")
+                    if number is None or receipt_hash is None:
+                        log.warning("Ignoring incomplete receipt for %s", tx_hash)
+                        continue
+                    block = node.w3.eth.get_block(int(number))
+                    if bytes(block["hash"]) != bytes(receipt_hash):
+                        log.warning("Ignoring noncanonical receipt for %s from %s", tx_hash, redact_url(node.url))
+                        continue
+                    latest = int(node.w3.eth.block_number)
+                    confirmations = max(0, latest - int(number) + 1)
                     self._success(node)
-                    return tx_hash, receipt
+                    return tx_hash, receipt, confirmations
                 except TransactionNotFound:
                     self._success(node)
                 except Exception as exc:
@@ -1025,7 +1048,9 @@ class Sweeper:
                 rounding=ROUND_CEILING
             )
         )
-        gas_limit = max(21_000, padded)
+        # Plain EOA transfers require exactly 21,000 gas. Padding them by
+        # GAS_ESTIMATE_MULTIPLIER would reject the default GAS_LIMIT=21,000.
+        gas_limit = 21_000 if estimate <= 21_000 else padded
         if gas_limit > self.cfg.gas_limit:
             raise ConfigError(
                 f"Estimated gas limit {gas_limit} exceeds configured GAS_LIMIT={self.cfg.gas_limit}. "
@@ -1036,6 +1061,18 @@ class Sweeper:
     def _build_new_tx(self, nonce: int) -> dict[str, Any]:
         fee = self._fee_data()
         balance = self._current_balance()
+        # Do not ask an RPC to estimate an unaffordable transfer: many nodes
+        # reject it with a misleading insufficient-funds error instead of
+        # allowing the normal no-balance exit path.
+        minimum_budget = 21_000 * self._replacement_budget_per_gas(fee)
+        if balance - minimum_budget - self.cfg.reserve_wei < self.cfg.min_sweep_wei:
+            raise NoSweepableBalance(
+                "No sweepable balance even at the minimum 21,000 gas: "
+                f"balance={wei_to_coin(balance)}, "
+                f"replacement_budget={wei_to_coin(minimum_budget)}, "
+                f"reserve={wei_to_coin(self.cfg.reserve_wei)}, "
+                f"minimum={wei_to_coin(self.cfg.min_sweep_wei)}"
+            )
         gas_limit = self._determine_gas_limit(fee, balance)
         quoted_fee_cost = gas_limit * self._fee_ceiling(fee)
         replacement_budget = gas_limit * self._replacement_budget_per_gas(fee)
@@ -1195,6 +1232,36 @@ class Sweeper:
                     f"State raw transaction signer {recovered} does not match {self.from_addr}"
                 )
 
+            # Hash and signer verification alone do not prove that a saved
+            # transaction pays the configured destination, amount, or nonce.
+            # Ethereum signatures are deterministic: re-signing the exact
+            # permitted transaction must reproduce the persisted raw bytes.
+            # This also rejects unexpected calldata, access lists or fee types.
+            expected_tx = {
+                "chainId": self.chain_id,
+                "nonce": int(state["nonce"]),
+                "to": self.to_addr,
+                "value": int(state["value"]),
+                "gas": int(state["gas"]),
+                **{key: int(value) for key, value in entry["fee"].items()},
+            }
+            if "maxFeePerGas" in entry["fee"]:
+                expected_tx["type"] = 2
+                if expected_tx["maxPriorityFeePerGas"] > expected_tx["maxFeePerGas"]:
+                    raise StateError("State priority fee exceeds max fee")
+            try:
+                signed = self.account.sign_transaction(expected_tx)
+                expected_raw = getattr(signed, "raw_transaction", None)
+                if expected_raw is None:
+                    expected_raw = getattr(signed, "rawTransaction")
+            except Exception as exc:
+                raise StateError("Unable to re-sign transaction fields from saved state") from exc
+            if bytes(expected_raw) != raw:
+                raise StateError(
+                    "Saved raw transaction does not match the configured chain, nonce, "
+                    "destination, value, gas limit and fee; refusing to broadcast"
+                )
+
     @staticmethod
     def _all_hashes(state: dict[str, Any]) -> list[str]:
         hashes = [entry["tx_hash"] for entry in state.get("history", [])]
@@ -1216,16 +1283,7 @@ class Sweeper:
         )
 
     def _receipt_info(self, state: dict[str, Any]) -> Optional[tuple[str, Any, int]]:
-        found = self.rpc.find_any_receipt(self._all_hashes(state))
-        if found is None:
-            return None
-        tx_hash, receipt = found
-        block_number = receipt.get("blockNumber")
-        if block_number is None:
-            return None
-        latest_block = int(self.rpc.call("latest block number", lambda w3: w3.eth.block_number))
-        confirmations = max(0, latest_block - int(block_number) + 1)
-        return tx_hash, receipt, confirmations
+        return self.rpc.find_any_receipt(self._all_hashes(state))
 
     def _confirmed_receipt(self, state: dict[str, Any]) -> Optional[tuple[str, Any]]:
         info = self._receipt_info(state)
@@ -1244,7 +1302,11 @@ class Sweeper:
         return tx_hash, receipt
 
     def _handle_receipt(self, tx_hash: str, receipt: Any, state: dict[str, Any]) -> bool:
-        status = int(receipt.get("status", 0))
+        if receipt.get("status") is None:
+            raise StateError(f"Receipt for {tx_hash} has no execution status; state preserved")
+        status = int(receipt["status"])
+        if status not in (0, 1):
+            raise StateError(f"Receipt for {tx_hash} has invalid status {status}; state preserved")
         block_number = receipt.get("blockNumber")
         gas_used = receipt.get("gasUsed")
         effective_gas_price = receipt.get("effectiveGasPrice")
@@ -1328,18 +1390,24 @@ class Sweeper:
             interruptible_sleep(self.cfg.receipt_poll_sec + random.uniform(0.0, 1.0))
         return None
 
-    def _replace(self, state: dict[str, Any]) -> dict[str, Any]:
-        # Close the race between the final receipt poll and signing a replacement.
-        self._reconcile_nonce_consumed(state)
+    def _replace(self, state: dict[str, Any]) -> Optional[dict[str, Any]]:
+        if SHUTDOWN:
+            return state
+        # Reconciliation can finish and CLEAR the state: never keep using it.
+        if self._reconcile_nonce_consumed(state):
+            return None
         info = self._receipt_info(state)
         if info is not None:
             tx_hash, receipt, confirmations = info
             if confirmations >= self.cfg.min_confirmations:
                 self._handle_receipt(tx_hash, receipt, state)
+                return None
             raise SweeperError(
                 f"Known transaction {tx_hash} became mined while preparing a replacement; "
                 "replacement aborted and state preserved"
             )
+        if SHUTDOWN:
+            return state
 
         count = int(state["replacement_count"])
         if count >= self.cfg.max_replacements:
@@ -1349,6 +1417,8 @@ class Sweeper:
             )
 
         replacement_tx = self._build_replacement_tx(state)
+        if SHUTDOWN:
+            return state
         old_current = state["current"]
         new_current = self._sign(replacement_tx)
         history_entry = dict(old_current)
@@ -1366,11 +1436,14 @@ class Sweeper:
             state["replacement_count"],
         )
         self._print_summary(state, "Replacement:")
+        if SHUTDOWN:
+            return state  # Signed replacement is recoverable on restart.
         result = self._broadcast_current(state)
         if result.replacement_underpriced and not result.accepted:
             log.warning("Replacement was underpriced on all responding RPCs; another bump will follow")
         if result.nonce_too_low and not result.accepted:
-            self._reconcile_nonce_consumed(state)
+            if self._reconcile_nonce_consumed(state):
+                return None
         return state
 
     def _monitor(self, state: dict[str, Any]) -> bool:
@@ -1399,18 +1472,25 @@ class Sweeper:
                 interruptible_sleep(self.cfg.receipt_poll_sec + random.uniform(0.0, 1.0))
                 continue
 
-            self._reconcile_nonce_consumed(state)
+            if self._reconcile_nonce_consumed(state):
+                return True
+            if SHUTDOWN:
+                break
             current = state["current"]
             since_broadcast = time.time() - float(current.get("last_broadcast_at", 0) or 0)
             if since_broadcast >= self.cfg.rebroadcast_every_sec:
                 log.info("Rebroadcasting current tx: %s", current["tx_hash"])
                 result = self._broadcast_current(state)
                 if result.nonce_too_low and not result.accepted:
-                    self._reconcile_nonce_consumed(state)
+                    if self._reconcile_nonce_consumed(state):
+                        return True
 
             receipt = self._wait_for_receipt(state, self.cfg.receipt_timeout_sec)
             if receipt is not None:
                 return self._handle_receipt(receipt[0], receipt[1], state)
+
+            if SHUTDOWN:
+                break
 
             # A tx may have become mined during the wait without yet reaching
             # MIN_CONFIRMATIONS. In that case replacement would be unsafe.
@@ -1425,7 +1505,10 @@ class Sweeper:
                 )
                 continue
 
-            state = self._replace(state)
+            replacement = self._replace(state)
+            if replacement is None:  # Confirmed during replacement preparation.
+                return True
+            state = replacement
 
         log.warning("Stopped with recoverable state preserved at %s", self.cfg.state_file)
         return False
@@ -1469,7 +1552,8 @@ class Sweeper:
             self.state.save(state)
             result = self._broadcast_current(state)
             if result.nonce_too_low and not result.accepted:
-                self._reconcile_nonce_consumed(state)
+                if self._reconcile_nonce_consumed(state):
+                    continue
             if not self._monitor(state):
                 return
 
